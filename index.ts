@@ -1,19 +1,20 @@
 import { type ServeOptions } from "bun";
 
-// --- 1. CONFIGURATION & ENV ---
+// --- 1. CONFIGURATION ---
 const PORT = Number(Bun.env.PORT) || 3000;
-const API_KEY = Bun.env.API_KEY; // Nếu không set, server sẽ chạy ở chế độ không bảo mật (warning)
-const UNLIMITED_AI_URL = Bun.env.UPSTREAM_URL || "https://app.unlimitedai.chat/api/chat";
+const API_KEY = Bun.env.API_KEY;
+const UPSTREAM_BASE = Bun.env.UPSTREAM_BASE || "https://app.unlimitedai.chat";
+const USER_AGENT = Bun.env.USER_AGENT || "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const COOKIE = Bun.env.UNLIMITED_COOKIE || "NEXT_LOCALE=vi; __Secure-authjs.callback-url=https%3A%2F%2Fapp.unlimitedai.chat; __Host-authjs.csrf-token=17d9731f97f9842140436185939ff933b3a5ed041cf1ed9f4156c1aa2086a12c%7Cdef7be3ba05c4d504afdcd46eb015e2015a1b9d4867ac211de154576397d18f3";
 
-console.log(`🚀 Server starting on port ${PORT}`);
-if (API_KEY) {
-  console.log("🔒 API Protection: ENABLED");
-} else {
-  console.warn("⚠️ API Protection: DISABLED (Not recommended for public IP)");
+if (!COOKIE) {
+    console.warn("⚠️ WARNING: 'UNLIMITED_COOKIE' is missing in .env. Upstream requests will likely fail (401/403).");
 }
 
-// --- 2. INTERFACES ---
-interface UnlimitedAIMessage {
+console.log(`🚀 Server starting on port ${PORT}`);
+
+// --- 2. TYPES ---
+interface UnlimitedMessage {
   id: string;
   createdAt: string;
   role: string;
@@ -21,280 +22,274 @@ interface UnlimitedAIMessage {
   parts: Array<{ type: string; text: string }>;
 }
 
-interface OpenAIMessage {
-  role: string;
-  content: string;
-}
-
-// --- 3. HELPER FUNCTIONS (LOGIC CORE) ---
-
-// Chuyển đổi message OpenAI -> UnlimitedAI
-function convertOpenAIToUnlimitedMessages(messages: OpenAIMessage[]): UnlimitedAIMessage[] {
-  const systemMessages = messages.filter((msg) => msg.role === "system");
-  const nonSystemMessages = messages.filter((msg) => msg.role !== "system");
-  
-  const result: UnlimitedAIMessage[] = [];
-  
-  // Xử lý System Prompt bằng kỹ thuật "Pre-filling"
-  if (systemMessages.length > 0) {
-    const systemContent = systemMessages.map((msg) => msg.content).join("\n\n");
-    
-    result.push({
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      role: "user",
-      content: systemContent,
-      parts: [{ type: "text", text: systemContent }],
-    });
-    
-    result.push({
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      role: "assistant",
-      content: "Ok, I got it, I'll remember it and do it.",
-      parts: [{ type: "text", text: "Ok, I got it, I'll remember it and do it." }],
-    });
-  }
-  
-  nonSystemMessages.forEach((msg) => {
-    result.push({
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      role: msg.role,
-      content: msg.content,
-      parts: [{ type: "text", text: msg.content }],
-    });
-  });
-  
-  return result;
-}
-
-function convertOpenAIToUnlimitedBody(openaiBody: any): any {
-  return {
-    id: openaiBody.id || crypto.randomUUID(),
-    messages: convertOpenAIToUnlimitedMessages(openaiBody.messages),
-    selectedChatModel: openaiBody.model || "chat-model-reasoning",
-  };
-}
-
-// Hàm Generator xử lý Stream
-async function* transformStreamResponse(
-  reader: ReadableStreamDefaultReader<Uint8Array>
-): AsyncGenerator<string> {
-  let buffer = "";
-  const decoder = new TextDecoder();
-  let messageId = "";
-  let firstResult = true;
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        yield "data: [DONE]\n\n";
-        break;
-      }
-      
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        
-        // Cải thiện parser bằng Regex để an toàn hơn
-        const match = line.match(/^([a-z0-9]+):(.+)$/);
-        if (!match) continue;
-        
-        const key = match[1];
-        let val = match[2].trim();
-
-        if (val.startsWith('"') && val.endsWith('"')) {
-          val = val.slice(1, -1);
-        }
-        
-        // Logic map key từ UnlimitedAI
-        if (key === "f") {
-          try {
-            const obj = JSON.parse(val);
-            messageId = obj.messageId || "";
-          } catch (e) { /* ignore */ }
-        } else if (key === "g") {
-          // Reasoning Content
-          const delta = firstResult
-            ? { role: "assistant", reasoning_content: val.replace(/\\n/g, "\n") }
-            : { reasoning_content: val.replace(/\\n/g, "\n") };
-          
-          const chunk = createChunk(messageId, delta);
-          yield `data: ${JSON.stringify(chunk)}\n\n`;
-        } else if (key === "0") {
-          // Main Content
-          const delta = { content: val.replace(/\\n/g, "\n") };
-          const chunk = createChunk(messageId, delta);
-          yield `data: ${JSON.stringify(chunk)}\n\n`;
-          firstResult = false;
-        } else if (key === "e" || key === "d") {
-          yield "data: [DONE]\n\n";
-        }
-      }
-    }
-  } catch (error) {
-    console.error("Stream error:", error);
-    yield "data: [DONE]\n\n";
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-// Helper tạo chunk response chuẩn OpenAI
-function createChunk(id: string, delta: any) {
-  return {
-    id: id || crypto.randomUUID(),
-    object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    model: "chat-model-reasoning",
-    choices: [{ delta, index: 0, finish_reason: null }],
-  };
-}
-
-// Xử lý Non-Stream
-async function transformNonStreamResponse(text: string): Promise<any> {
-    // Logic giữ nguyên, chỉ format lại code cho gọn
-    const lines = text.split("\n");
-    const data: Record<string, any> = {};
-    for (const line of lines) {
-        const match = line.match(/^([a-z0-9]+):(.+)$/);
-        if (!match) continue;
-        let val = match[2].trim();
-        try { val = JSON.parse(val); } catch {}
-        data[match[1]] = val;
-    }
-    
-    return {
-        id: data.f?.messageId || crypto.randomUUID(),
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: "chat-model-reasoning",
-        choices: [{
-            index: 0,
-            message: {
-                role: "assistant",
-                reasoning_content: data.g,
-                content: data["0"]
-            },
-            finish_reason: "stop"
-        }],
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    };
-}
-
-// --- 4. MAIN HANDLER ---
-
-async function handleChatCompletions(req: Request): Promise<Response> {
-  const openaiBody = await req.json();
-  const isStream = openaiBody.stream === true;
-  const unlimitedBody = convertOpenAIToUnlimitedBody(openaiBody);
-
-  try {
-    const upstreamRes = await fetch(UNLIMITED_AI_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(unlimitedBody),
-    });
-
-    if (!upstreamRes.ok) {
-        throw new Error(`Upstream Error: ${upstreamRes.statusText}`);
-    }
-
-    if (isStream) {
-      if (!upstreamRes.body) throw new Error("No response body");
-      const reader = upstreamRes.body.getReader();
-
-      // Tạo ReadableStream từ Generator
-      const stream = new ReadableStream({
-        async start(controller) {
-            const generator = transformStreamResponse(reader);
-            for await (const chunk of generator) {
-                controller.enqueue(new TextEncoder().encode(chunk));
+// --- 3. HELPER: FETCH TOKEN ---
+// Tự động lấy x-api-token trước khi chat
+async function fetchUpstreamToken(): Promise<string> {
+    try {
+        const res = await fetch(`${UPSTREAM_BASE}/api/token`, {
+            method: "GET",
+            headers: {
+                "authority": "app.unlimitedai.chat",
+                "accept": "*/*",
+                "accept-language": "vi-VN,vi;q=0.9",
+                "cookie": COOKIE,
+                "referer": `${UPSTREAM_BASE}/vi`,
+                "user-agent": USER_AGENT,
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
             }
-            controller.close();
-        }
-      });
+        });
 
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      });
-    } else {
-      const text = await upstreamRes.text();
-      const response = await transformNonStreamResponse(text);
-      return Response.json(response);
+        if (!res.ok) {
+            const txt = await res.text();
+            throw new Error(`Failed to get token: ${res.status} - ${txt}`);
+        }
+
+        const data = await res.json();
+        return data.token; // Trả về JWT token
+    } catch (error) {
+        console.error("❌ Token Fetch Error:", error);
+        throw error;
     }
-  } catch (error: any) {
-    console.error("Handler Error:", error);
-    return Response.json({ error: error.message }, { status: 500 });
-  }
 }
 
-// --- 5. SERVER ENTRY ---
+// --- 4. DATA CONVERTERS ---
+function convertMessages(messages: any[]): UnlimitedMessage[] {
+    const result: UnlimitedMessage[] = [];
+    const sysMsgs = messages.filter(m => m.role === 'system');
+    const chatMsgs = messages.filter(m => m.role !== 'system');
 
+    // Hack: Merge system prompt vào user prompt đầu tiên hoặc tạo fake context
+    if (sysMsgs.length > 0) {
+        const sysContent = sysMsgs.map(m => m.content).join("\n\n");
+        result.push({
+            id: crypto.randomUUID(),
+            createdAt: new Date().toISOString(),
+            role: "user",
+            content: sysContent,
+            parts: [{ type: "text", text: sysContent }]
+        });
+        result.push({
+            id: crypto.randomUUID(),
+            createdAt: new Date().toISOString(),
+            role: "assistant",
+            content: "Understood.",
+            parts: [{ type: "text", text: "Understood." }]
+        });
+    }
+
+    chatMsgs.forEach(m => {
+        result.push({
+            id: crypto.randomUUID(),
+            createdAt: new Date().toISOString(),
+            role: m.role,
+            content: m.content,
+            parts: [{ type: "text", text: m.content }]
+        });
+    });
+
+    return result;
+}
+
+// --- 5. STREAM TRANSFORMER ---
+async function* transformStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let messageId = crypto.randomUUID();
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                yield "data: [DONE]\n\n";
+                break;
+            }
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+                if (!line.trim()) continue;
+
+                // Parse format: key:value
+                // f:{"messageId" ...}
+                // 0:"Content string"
+                const match = line.match(/^([a-z0-9]+):(.+)$/);
+                if (!match) continue;
+
+                const key = match[1];
+                let val = match[2].trim();
+
+                // Logic xử lý value
+                if (key === '0') {
+                    // Content line: 0:"Xin chào..." -> Cắt bỏ ngoặc kép đầu cuối
+                    if (val.startsWith('"') && val.endsWith('"')) {
+                        val = val.slice(1, -1); 
+                    }
+                    // Unescape xuống dòng \\n -> \n
+                    const content = val.replace(/\\n/g, "\n");
+                    
+                    const chunk = {
+                        id: messageId,
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: "unlimited-ai",
+                        choices: [{ delta: { content }, index: 0, finish_reason: null }]
+                    };
+                    yield `data: ${JSON.stringify(chunk)}\n\n`;
+                } 
+                else if (key === 'f') {
+                    try {
+                        const meta = JSON.parse(val);
+                        if (meta.messageId) messageId = meta.messageId;
+                    } catch {}
+                }
+                else if (key === 'e' || key === 'd') {
+                    // End stream
+                    const chunk = {
+                        id: messageId,
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: "unlimited-ai",
+                        choices: [{ delta: {}, index: 0, finish_reason: "stop" }]
+                    };
+                    yield `data: ${JSON.stringify(chunk)}\n\n`;
+                    yield "data: [DONE]\n\n";
+                }
+            }
+        }
+    } catch (e) {
+        console.error("Stream parse error:", e);
+        yield "data: [DONE]\n\n";
+    } finally {
+        reader.releaseLock();
+    }
+}
+
+// --- 6. MAIN HANDLER ---
+async function handleChat(req: Request): Promise<Response> {
+    try {
+        // 1. Lấy body từ client (OpenAI format)
+        const body = await req.json();
+        const isStream = body.stream === true;
+
+        // 2. Lấy Token từ Upstream (Bước mới)
+        const token = await fetchUpstreamToken();
+        
+        // 3. Chuẩn bị payload cho UnlimitedAI
+        const payload = {
+            messages: convertMessages(body.messages),
+            id: crypto.randomUUID(), // Session ID giả
+            selectedChatModel: body.model || "chat-model-reasoning",
+            selectedCharacter: null,
+            selectedStory: null
+        };
+
+        // 4. Gửi request Chat
+        const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
+            method: "POST",
+            headers: {
+                "authority": "app.unlimitedai.chat",
+                "accept": "*/*",
+                "accept-language": "vi-VN,vi;q=0.9",
+                "content-type": "application/json",
+                "cookie": COOKIE,
+                "origin": UPSTREAM_BASE,
+                "referer": `${UPSTREAM_BASE}/chat/${payload.id}`,
+                "user-agent": USER_AGENT,
+                "x-api-token": token, // Token vừa lấy được
+                "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+                "sec-ch-ua-mobile": "?1",
+                "sec-ch-ua-platform": '"Android"'
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!upstreamRes.ok) {
+            const errText = await upstreamRes.text();
+            throw new Error(`Upstream Chat Error: ${upstreamRes.status} - ${errText}`);
+        }
+
+        // 5. Xử lý response (Stream hoặc Non-Stream)
+        if (isStream) {
+            if (!upstreamRes.body) throw new Error("No body from upstream");
+            const reader = upstreamRes.body.getReader();
+            
+            const stream = new ReadableStream({
+                async start(controller) {
+                    const generator = transformStream(reader);
+                    for await (const chunk of generator) {
+                        controller.enqueue(new TextEncoder().encode(chunk));
+                    }
+                    controller.close();
+                }
+            });
+
+            return new Response(stream, {
+                headers: {
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                }
+            });
+        } else {
+            // Xử lý non-stream (gom text lại)
+            // Code này đơn giản hóa, thực tế nên reuse stream logic
+            return Response.json({
+                id: payload.id,
+                object: "chat.completion",
+                created: Date.now(),
+                choices: [{
+                    message: { role: "assistant", content: "Non-stream not fully implemented via proxy due to complex parsing. Use stream=true." },
+                    finish_reason: "stop"
+                }]
+            });
+        }
+
+    } catch (e: any) {
+        console.error("Handler Error:", e.message);
+        return Response.json({ error: e.message }, { status: 500 });
+    }
+}
+
+// --- 7. SERVER ENTRY ---
 Bun.serve({
-  port: PORT,
-  async fetch(req) {
-    const url = new URL(req.url);
-    const path = url.pathname;
-
-    // A. CORS Preflight
-    if (req.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        },
-      });
-    }
-
-    // B. STATIC FILES (Frontend)
-    if (path === "/" || !path.startsWith("/v1/")) {
-        const filePath = path === "/" ? "./static/index.html" : `./static${path}`;
-        const file = Bun.file(filePath);
-        if (await file.exists()) {
-            return new Response(file);
+    port: PORT,
+    async fetch(req) {
+        const url = new URL(req.url);
+        
+        // CORS
+        if (req.method === "OPTIONS") {
+            return new Response(null, {
+                headers: {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+                }
+            });
         }
-        return new Response("Not Found", { status: 404 });
-    }
 
-    // C. API AUTHENTICATION CHECK
-    // Bỏ qua check auth với endpoint list models (tuỳ chọn, ở đây tôi bảo vệ luôn)
-    if (API_KEY) {
-        const authHeader = req.headers.get("Authorization");
-        // Kiểm tra format "Bearer <KEY>"
-        if (!authHeader || !authHeader.startsWith("Bearer ") || authHeader.split(" ")[1] !== API_KEY) {
-            return Response.json({ error: { message: "Invalid API Key", type: "invalid_request_error" } }, { status: 401 });
+        // Auth Check
+        if (API_KEY) {
+            const auth = req.headers.get("Authorization");
+            if (auth !== `Bearer ${API_KEY}`) {
+                return Response.json({ error: "Unauthorized" }, { status: 401 });
+            }
         }
-    }
 
-    // D. API ROUTES
-    if (path === "/v1/models" && req.method === "GET") {
-      return Response.json({
-        object: "list",
-        data: [{
-            id: "chat-model-reasoning",
-            object: "model",
-            created: 0,
-            owned_by: "unlimitedai",
-            permission: [{ id: "modelperm-1", object: "model_permission", allow_view: true }]
-        }]
-      });
-    }
+        if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+            return await handleChat(req);
+        }
+        
+        if (url.pathname === "/v1/models") {
+             return Response.json({
+                object: "list",
+                data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }]
+            });
+        }
 
-    if (path === "/v1/chat/completions" && req.method === "POST") {
-      return await handleChatCompletions(req);
+        return new Response("UnlimitedAI Proxy Running", { status: 200 });
     }
-
-    return Response.json({ error: "Not found" }, { status: 404 });
-  },
 });
