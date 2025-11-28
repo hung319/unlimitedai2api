@@ -171,7 +171,7 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
     }
 }
 
-// --- 5. MAIN HANDLER ---
+// --- 5. MAIN HANDLER (DEBUG VERSION) ---
 
 async function handleChat(req: Request): Promise<Response> {
     try {
@@ -185,18 +185,20 @@ async function handleChat(req: Request): Promise<Response> {
             messages: convertMessages(body.messages),
             id: crypto.randomUUID(),
             selectedChatModel: body.model || "chat-model-reasoning",
-            selectedCharacter: null, selectedStory: null
+            selectedCharacter: null, 
+            selectedStory: null
         };
+
+        // [DEBUG] Log payload gửi đi để kiểm tra
+        console.log("🔵 [DEBUG] Outgoing Payload:", JSON.stringify(payload, null, 2));
 
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
             method: "POST",
             headers: {
                 "authority": "app.unlimitedai.chat",
                 "content-type": "application/json",
-                // Dùng Cookie và Token tự động lấy
                 "cookie": session.cookie,
                 "x-api-token": session.token,
-                
                 "origin": UPSTREAM_BASE,
                 "referer": `${UPSTREAM_BASE}/chat/${payload.id}`,
                 "user-agent": USER_AGENT,
@@ -208,11 +210,17 @@ async function handleChat(req: Request): Promise<Response> {
         });
 
         if (!upstreamRes.ok) {
-            // Nếu lỗi 401/403 -> Session có thể chết -> Xóa cache để lần sau lấy mới
+            // [CRITICAL FIX] Đọc nội dung lỗi từ server thay vì chỉ throw status
+            const errorText = await upstreamRes.text(); 
+            console.error(`🔴 [DEBUG] Upstream Failed: ${upstreamRes.status}`);
+            console.error(`🔴 [DEBUG] Error Body: ${errorText}`);
+
+            // Nếu lỗi 401/403 -> Session chết -> Xóa cache
             if (upstreamRes.status === 401 || upstreamRes.status === 403) {
+                console.warn("⚠️ Invalid Session. Clearing cache...");
                 cachedSession = null;
             }
-            throw new Error(`Upstream Error: ${upstreamRes.status}`);
+            throw new Error(`Upstream Error: ${upstreamRes.status} | Details: ${errorText.substring(0, 200)}`);
         }
 
         if (!upstreamRes.body) throw new Error("No body");
@@ -263,7 +271,7 @@ async function handleChat(req: Request): Promise<Response> {
         }
 
     } catch (e: any) {
-        console.error("Handler Error:", e.message);
+        console.error("❌ Handler Error:", e.message);
         return Response.json({ error: e.message }, { status: 500 });
     }
 }
