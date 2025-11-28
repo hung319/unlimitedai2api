@@ -2,10 +2,10 @@ import { type ServeOptions } from "bun";
 
 // --- 1. CONFIGURATION ---
 const PORT = Number(Bun.env.PORT) || 3000;
-const API_KEY = Bun.env.API_KEY; // Bảo vệ API của bạn
+const API_KEY = Bun.env.API_KEY; // (Tùy chọn) Bảo vệ API của bạn
 const UPSTREAM_BASE = "https://app.unlimitedai.chat";
 
-// Giả lập trình duyệt Android giống log curl của bạn
+// Giả lập trình duyệt Android để tránh bị chặn
 const USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36";
 
 console.log(`🚀 Server starting on port ${PORT}`);
@@ -18,32 +18,28 @@ interface SessionData {
     expiresAt: number;
 }
 
-// Biến lưu session tạm thời để không phải login lại liên tục (Cache 5 phút)
+// Cache session 5 phút để tối ưu tốc độ
 let cachedSession: SessionData | null = null;
 
-// --- 3. AUTO-AUTH LOGIC (TRÁI TIM CỦA TOOL) ---
+// --- 3. AUTO-AUTH LOGIC ---
 
-// Helper: Parse header Set-Cookie trả về từ server
+// Helper: Parse header Set-Cookie chuẩn xác từ Bun
 function parseSetCookies(headers: Headers): string[] {
-    // Bun/Node fetch API trả về Set-Cookie dạng chuỗi hoặc mảng
     const cookies: string[] = [];
-    const cookieHeader = headers.get("set-cookie");
-    if (cookieHeader) {
-        // Xử lý split cơ bản (lưu ý: set-cookie có thể phức tạp hơn nhưng ở đây ta chỉ cần lấy key=value đầu tiên)
-        // Cách đơn giản nhất là lấy cookie thô
-        // Lưu ý: Bun trả về Set-Cookie nối nhau bằng dấu phẩy nếu dùng .get(), dùng .getSetCookie() là chuẩn nhất
+    
+    // @ts-ignore: Bun specific API
+    if (typeof headers.getSetCookie === 'function') {
         // @ts-ignore
-        if (typeof headers.getSetCookie === 'function') {
-             // @ts-ignore
-            const rawCookies = headers.getSetCookie();
-            rawCookies.forEach((c: string) => {
-                const parts = c.split(';');
-                if (parts[0]) cookies.push(parts[0]);
-            });
-        } else {
-            // Fallback cho môi trường cũ
+        const rawCookies = headers.getSetCookie();
+        rawCookies.forEach((c: string) => {
+            const parts = c.split(';');
+            if (parts[0]) cookies.push(parts[0]);
+        });
+    } else {
+        // Fallback cho môi trường không hỗ trợ getSetCookie
+        const cookieHeader = headers.get("set-cookie");
+        if (cookieHeader) {
             const parts = cookieHeader.split(', '); 
-            // Warning: split ',' rất nguy hiểm với cookie date, nhưng NextAuth cookie thường an toàn
             parts.forEach(p => {
                 const kv = p.split(';')[0];
                 if(kv) cookies.push(kv);
@@ -54,87 +50,96 @@ function parseSetCookies(headers: Headers): string[] {
 }
 
 async function getFreshSession(): Promise<SessionData> {
-    // Nếu đã có session và chưa hết hạn (trong 5 phút), dùng lại
+    // Dùng lại cache nếu còn hạn
     if (cachedSession && Date.now() < cachedSession.expiresAt) {
         return cachedSession;
     }
 
     console.log("🌐 Fetching new session from UnlimitedAI...");
 
-    // BƯỚC 1: Gọi endpoint CSRF để lấy Cookie "xịn" (__Host-authjs.csrf-token)
-    // Đây là bước thay thế việc bạn phải copy cookie thủ công
-    const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
-        headers: {
-            "user-agent": USER_AGENT,
-            "referer": UPSTREAM_BASE,
-        }
-    });
+    try {
+        // BƯỚC 1: Lấy CSRF & Cookies ban đầu
+        const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
+            headers: {
+                "user-agent": USER_AGENT,
+                "referer": UPSTREAM_BASE,
+            }
+        });
 
-    if (!csrfResp.ok) throw new Error("Failed to fetch CSRF cookies");
+        if (!csrfResp.ok) throw new Error(`CSRF Fetch Failed: ${csrfResp.status}`);
 
-    // Lấy các cookie server trả về
-    const serverCookies = parseSetCookies(csrfResp.headers);
-    
-    // Tạo chuỗi cookie hoàn chỉnh
-    // Thêm NEXT_LOCALE=vi như bạn yêu cầu
-    const cookieList = [`NEXT_LOCALE=vi`, ...serverCookies];
-    const cookieString = cookieList.join("; ");
+        const serverCookies = parseSetCookies(csrfResp.headers);
+        const cookieList = [`NEXT_LOCALE=vi`, ...serverCookies];
+        const cookieString = cookieList.join("; ");
 
-    // BƯỚC 2: Dùng Cookie đó để lấy JWT Token
-    const tokenResp = await fetch(`${UPSTREAM_BASE}/api/token`, {
-        headers: {
-            "cookie": cookieString, // Cookie vừa lấy được
-            "user-agent": USER_AGENT,
-            "referer": `${UPSTREAM_BASE}/vi`,
-            "accept": "*/*"
-        }
-    });
+        // BƯỚC 2: Lấy JWT Token
+        const tokenResp = await fetch(`${UPSTREAM_BASE}/api/token`, {
+            headers: {
+                "cookie": cookieString,
+                "user-agent": USER_AGENT,
+                "referer": `${UPSTREAM_BASE}/vi`,
+                "accept": "*/*"
+            }
+        });
 
-    if (!tokenResp.ok) throw new Error(`Failed to get API Token: ${tokenResp.status}`);
-    
-    const tokenData = await tokenResp.json();
-    const apiToken = tokenData.token;
+        if (!tokenResp.ok) throw new Error(`Token Fetch Failed: ${tokenResp.status}`);
+        
+        const tokenData = await tokenResp.json();
+        const apiToken = tokenData.token;
 
-    console.log("✅ Session refreshed successfully!");
+        console.log("✅ Session refreshed successfully!");
 
-    // Lưu cache 5 phút
-    cachedSession = {
-        cookie: cookieString,
-        token: apiToken,
-        expiresAt: Date.now() + (5 * 60 * 1000) 
-    };
+        cachedSession = {
+            cookie: cookieString,
+            token: apiToken,
+            expiresAt: Date.now() + (5 * 60 * 1000) // 5 phút
+        };
 
-    return cachedSession;
+        return cachedSession;
+    } catch (error) {
+        console.error("❌ Auth Error:", error);
+        throw error;
+    }
 }
 
-// --- 4. DATA CONVERTERS ---
-// (Giữ nguyên logic cũ)
+// --- 4. DATA CONVERTERS (CRITICAL FIX) ---
+// Hàm này đã được làm sạch để chỉ gửi đúng format OpenAI chuẩn
 function convertMessages(messages: any[]): any[] {
     const result: any[] = [];
     const sysMsgs = messages.filter(m => m.role === 'system');
     const chatMsgs = messages.filter(m => m.role !== 'system');
 
+    // Mẹo: Gom System prompt vào User prompt đầu tiên để tránh lỗi role
     if (sysMsgs.length > 0) {
         const sysContent = sysMsgs.map(m => m.content).join("\n\n");
         result.push({
-            id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: "user",
-            content: sysContent, parts: [{ type: "text", text: sysContent }]
+            role: "user",
+            content: `[System Instructions]:\n${sysContent}`
         });
+        // Fake phản hồi để model không bị loạn context
         result.push({
-            id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: "assistant",
-            content: "Understood.", parts: [{ type: "text", text: "Understood." }]
+            role: "assistant",
+            content: "Understood. I will follow these instructions."
         });
     }
 
     chatMsgs.forEach(m => {
+        // Fallback: Nếu content null (do tool gửi parts), lấy text từ parts
+        let finalContent = m.content;
+        if (!finalContent && Array.isArray(m.parts)) {
+            finalContent = m.parts.map((p: any) => p.text || "").join("");
+        }
+
+        // QUAN TRỌNG: Chỉ gửi role và content. Không gửi id, createdAt.
         result.push({
-            id: crypto.randomUUID(), createdAt: new Date().toISOString(), role: m.role,
-            content: m.content, parts: [{ type: "text", text: m.content }]
+            role: m.role,
+            content: finalContent || "" 
         });
     });
     return result;
 }
 
+// Parser cho SSE Stream từ Upstream
 async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -171,16 +176,17 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
     }
 }
 
-// --- 5. MAIN HANDLER (DEBUG VERSION) ---
+// --- 5. MAIN HANDLER ---
 
 async function handleChat(req: Request): Promise<Response> {
     try {
         const body = await req.json();
         const isStream = body.stream === true;
 
-        // TỰ ĐỘNG LẤY SESSION (Cookie + Token)
+        // 1. Lấy Session
         const session = await getFreshSession();
 
+        // 2. Chuẩn bị Payload sạch
         const payload = {
             messages: convertMessages(body.messages),
             id: crypto.randomUUID(),
@@ -189,9 +195,10 @@ async function handleChat(req: Request): Promise<Response> {
             selectedStory: null
         };
 
-        // [DEBUG] Log payload gửi đi để kiểm tra
-        console.log("🔵 [DEBUG] Outgoing Payload:", JSON.stringify(payload, null, 2));
+        // [LOG] In payload để debug nếu lỗi
+        console.log(`🔵 [DEBUG] Sending Payload (Model: ${payload.selectedChatModel})`);
 
+        // 3. Gọi Upstream
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
             method: "POST",
             headers: {
@@ -209,21 +216,25 @@ async function handleChat(req: Request): Promise<Response> {
             body: JSON.stringify(payload)
         });
 
+        // 4. Xử lý lỗi Upstream (Quan trọng: Đọc body lỗi)
         if (!upstreamRes.ok) {
-            // [CRITICAL FIX] Đọc nội dung lỗi từ server thay vì chỉ throw status
-            const errorText = await upstreamRes.text(); 
-            console.error(`🔴 [DEBUG] Upstream Failed: ${upstreamRes.status}`);
-            console.error(`🔴 [DEBUG] Error Body: ${errorText}`);
+            const errorText = await upstreamRes.text();
+            console.error(`🔴 [UPSTREAM ERROR] Status: ${upstreamRes.status}`);
+            console.error(`🔴 [UPSTREAM ERROR] Body: ${errorText}`);
 
-            // Nếu lỗi 401/403 -> Session chết -> Xóa cache
+            // Nếu lỗi Auth, xóa cache để lần sau lấy lại
             if (upstreamRes.status === 401 || upstreamRes.status === 403) {
-                console.warn("⚠️ Invalid Session. Clearing cache...");
                 cachedSession = null;
             }
-            throw new Error(`Upstream Error: ${upstreamRes.status} | Details: ${errorText.substring(0, 200)}`);
+            return Response.json({ 
+                error: `Upstream error: ${upstreamRes.status}`, 
+                details: errorText.substring(0, 500) 
+            }, { status: 500 });
         }
 
-        if (!upstreamRes.body) throw new Error("No body");
+        if (!upstreamRes.body) throw new Error("No body from upstream");
+
+        // 5. Xử lý Stream phản hồi
         const reader = upstreamRes.body.getReader();
         const parserIterator = parseUpstreamStream(reader);
 
@@ -243,6 +254,7 @@ async function handleChat(req: Request): Promise<Response> {
                         const delta: any = {};
                         if (chunk.type === 'content') delta.content = chunk.content;
                         if (chunk.type === 'reasoning') delta.reasoning_content = chunk.content;
+                        
                         const jsonChunk = JSON.stringify({
                             id: chunk.id, object: "chat.completion.chunk", created: Date.now()/1000,
                             model: "unlimited-ai", choices: [{ delta, index: 0, finish_reason: null }]
@@ -254,6 +266,7 @@ async function handleChat(req: Request): Promise<Response> {
             });
             return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
         } else {
+            // Xử lý Non-stream
             let fullContent = "";
             let fullReasoning = "";
             let finalId = payload.id;
@@ -280,13 +293,31 @@ async function handleChat(req: Request): Promise<Response> {
 Bun.serve({
     port: PORT,
     async fetch(req) {
-        if (req.method === "OPTIONS") return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*" } });
-        if (API_KEY && req.headers.get("Authorization") !== `Bearer ${API_KEY}`) return Response.json({ error: "Unauthorized" }, { status: 401 });
+        if (req.method === "OPTIONS") {
+            return new Response(null, { 
+                headers: { 
+                    "Access-Control-Allow-Origin": "*", 
+                    "Access-Control-Allow-Methods": "POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "*" 
+                } 
+            });
+        }
+
+        if (API_KEY && req.headers.get("Authorization") !== `Bearer ${API_KEY}`) {
+            return Response.json({ error: "Unauthorized" }, { status: 401 });
+        }
 
         const url = new URL(req.url);
         if (url.pathname === "/v1/chat/completions" && req.method === "POST") return await handleChat(req);
-        if (url.pathname === "/v1/models") return Response.json({ object: "list", data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] });
+        
+        // Mock model list endpoint
+        if (url.pathname === "/v1/models") {
+            return Response.json({ 
+                object: "list", 
+                data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] 
+            });
+        }
 
-        return new Response("UnlimitedAI Proxy (Auto-Auth Mode) Ready");
+        return new Response("UnlimitedAI Proxy (Release v1.0) Ready");
     }
 });
