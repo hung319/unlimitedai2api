@@ -2,10 +2,10 @@ import { type ServeOptions } from "bun";
 
 // --- 1. CONFIGURATION ---
 const PORT = Number(Bun.env.PORT) || 3000;
-const API_KEY = Bun.env.API_KEY; // (Tùy chọn) Bảo vệ API của bạn
+const API_KEY = Bun.env.API_KEY; 
 const UPSTREAM_BASE = "https://app.unlimitedai.chat";
 
-// Giả lập trình duyệt Android để tránh bị chặn
+// User Agent giả lập Android
 const USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36";
 
 console.log(`🚀 Server starting on port ${PORT}`);
@@ -18,16 +18,12 @@ interface SessionData {
     expiresAt: number;
 }
 
-// Cache session 5 phút để tối ưu tốc độ
 let cachedSession: SessionData | null = null;
 
 // --- 3. AUTO-AUTH LOGIC ---
-
-// Helper: Parse header Set-Cookie chuẩn xác từ Bun
 function parseSetCookies(headers: Headers): string[] {
     const cookies: string[] = [];
-    
-    // @ts-ignore: Bun specific API
+    // @ts-ignore
     if (typeof headers.getSetCookie === 'function') {
         // @ts-ignore
         const rawCookies = headers.getSetCookie();
@@ -36,7 +32,6 @@ function parseSetCookies(headers: Headers): string[] {
             if (parts[0]) cookies.push(parts[0]);
         });
     } else {
-        // Fallback cho môi trường không hỗ trợ getSetCookie
         const cookieHeader = headers.get("set-cookie");
         if (cookieHeader) {
             const parts = cookieHeader.split(', '); 
@@ -50,7 +45,6 @@ function parseSetCookies(headers: Headers): string[] {
 }
 
 async function getFreshSession(): Promise<SessionData> {
-    // Dùng lại cache nếu còn hạn
     if (cachedSession && Date.now() < cachedSession.expiresAt) {
         return cachedSession;
     }
@@ -58,12 +52,8 @@ async function getFreshSession(): Promise<SessionData> {
     console.log("🌐 Fetching new session from UnlimitedAI...");
 
     try {
-        // BƯỚC 1: Lấy CSRF & Cookies ban đầu
         const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
-            headers: {
-                "user-agent": USER_AGENT,
-                "referer": UPSTREAM_BASE,
-            }
+            headers: { "user-agent": USER_AGENT, "referer": UPSTREAM_BASE }
         });
 
         if (!csrfResp.ok) throw new Error(`CSRF Fetch Failed: ${csrfResp.status}`);
@@ -72,7 +62,6 @@ async function getFreshSession(): Promise<SessionData> {
         const cookieList = [`NEXT_LOCALE=vi`, ...serverCookies];
         const cookieString = cookieList.join("; ");
 
-        // BƯỚC 2: Lấy JWT Token
         const tokenResp = await fetch(`${UPSTREAM_BASE}/api/token`, {
             headers: {
                 "cookie": cookieString,
@@ -92,7 +81,7 @@ async function getFreshSession(): Promise<SessionData> {
         cachedSession = {
             cookie: cookieString,
             token: apiToken,
-            expiresAt: Date.now() + (5 * 60 * 1000) // 5 phút
+            expiresAt: Date.now() + (5 * 60 * 1000)
         };
 
         return cachedSession;
@@ -102,44 +91,78 @@ async function getFreshSession(): Promise<SessionData> {
     }
 }
 
-// --- 4. DATA CONVERTERS (CRITICAL FIX) ---
-// Hàm này đã được làm sạch để chỉ gửi đúng format OpenAI chuẩn
+// --- 4. DATA CONVERTERS (ROBUST FIX) ---
+
+// Helper để trích xuất text từ mọi cấu trúc data quái dị
+function extractText(content: any): string {
+    if (!content) return "";
+    if (typeof content === "string") return content;
+    
+    // Nếu là Array (VD: Multi-modal content hoặc parts)
+    if (Array.isArray(content)) {
+        return content.map((item: any) => {
+            if (typeof item === "string") return item;
+            if (item.text) return extractText(item.text); // Đệ quy nếu text lại là object/array
+            return "";
+        }).join("\n");
+    }
+    
+    // Nếu là Object có field text
+    if (typeof content === "object" && content.text) {
+        return extractText(content.text);
+    }
+    
+    return "";
+}
+
 function convertMessages(messages: any[]): any[] {
     const result: any[] = [];
     const sysMsgs = messages.filter(m => m.role === 'system');
     const chatMsgs = messages.filter(m => m.role !== 'system');
 
-    // Mẹo: Gom System prompt vào User prompt đầu tiên để tránh lỗi role
+    // 1. Gộp System Prompts
     if (sysMsgs.length > 0) {
-        const sysContent = sysMsgs.map(m => m.content).join("\n\n");
-        result.push({
-            role: "user",
-            content: `[System Instructions]:\n${sysContent}`
-        });
-        // Fake phản hồi để model không bị loạn context
-        result.push({
-            role: "assistant",
-            content: "Understood. I will follow these instructions."
-        });
+        const sysContent = sysMsgs.map(m => extractText(m.content)).join("\n\n");
+        if (sysContent.trim()) {
+            result.push({
+                role: "user",
+                content: `[System Instructions]:\n${sysContent}`
+            });
+            result.push({
+                role: "assistant",
+                content: "Understood."
+            });
+        }
     }
 
+    // 2. Xử lý Chat Messages & Lọc bỏ tin nhắn rỗng
     chatMsgs.forEach(m => {
-        // Fallback: Nếu content null (do tool gửi parts), lấy text từ parts
-        let finalContent = m.content;
-        if (!finalContent && Array.isArray(m.parts)) {
-            finalContent = m.parts.map((p: any) => p.text || "").join("");
+        // Ưu tiên lấy từ content, nếu không có thì lấy từ parts (fallback cho format cũ)
+        let rawContent = m.content;
+        if ((!rawContent || rawContent.length === 0) && m.parts) {
+            rawContent = m.parts;
         }
 
-        // QUAN TRỌNG: Chỉ gửi role và content. Không gửi id, createdAt.
-        result.push({
-            role: m.role,
-            content: finalContent || "" 
-        });
+        const finalContent = extractText(rawContent).trim();
+
+        // [QUAN TRỌNG] Chỉ thêm vào list nếu có nội dung thực sự
+        if (finalContent.length > 0) {
+            result.push({
+                role: m.role,
+                content: finalContent
+            });
+        }
     });
+
+    // Fallback an toàn: Nếu sau khi lọc mà không còn tin nhắn nào (hiếm gặp), thêm 1 tin dummy
+    if (result.length === 0) {
+        result.push({ role: "user", content: "Hello" });
+    }
+
     return result;
 }
 
-// Parser cho SSE Stream từ Upstream
+// Parser cho SSE Stream
 async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -183,22 +206,21 @@ async function handleChat(req: Request): Promise<Response> {
         const body = await req.json();
         const isStream = body.stream === true;
 
-        // 1. Lấy Session
         const session = await getFreshSession();
 
-        // 2. Chuẩn bị Payload sạch
+        // Clean & Filter Messages
+        const cleanMessages = convertMessages(body.messages);
+
         const payload = {
-            messages: convertMessages(body.messages),
+            messages: cleanMessages,
             id: crypto.randomUUID(),
             selectedChatModel: body.model || "chat-model-reasoning",
             selectedCharacter: null, 
             selectedStory: null
         };
 
-        // [LOG] In payload để debug nếu lỗi
-        console.log(`🔵 [DEBUG] Sending Payload (Model: ${payload.selectedChatModel})`);
+        console.log(`🔵 [DEBUG] Sending Payload (Model: ${payload.selectedChatModel} | Msgs: ${payload.messages.length})`);
 
-        // 3. Gọi Upstream
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
             method: "POST",
             headers: {
@@ -216,25 +238,19 @@ async function handleChat(req: Request): Promise<Response> {
             body: JSON.stringify(payload)
         });
 
-        // 4. Xử lý lỗi Upstream (Quan trọng: Đọc body lỗi)
         if (!upstreamRes.ok) {
             const errorText = await upstreamRes.text();
             console.error(`🔴 [UPSTREAM ERROR] Status: ${upstreamRes.status}`);
             console.error(`🔴 [UPSTREAM ERROR] Body: ${errorText}`);
 
-            // Nếu lỗi Auth, xóa cache để lần sau lấy lại
             if (upstreamRes.status === 401 || upstreamRes.status === 403) {
                 cachedSession = null;
             }
-            return Response.json({ 
-                error: `Upstream error: ${upstreamRes.status}`, 
-                details: errorText.substring(0, 500) 
-            }, { status: 500 });
+            return Response.json({ error: `Upstream error: ${upstreamRes.status}`, details: errorText }, { status: 500 });
         }
 
         if (!upstreamRes.body) throw new Error("No body from upstream");
 
-        // 5. Xử lý Stream phản hồi
         const reader = upstreamRes.body.getReader();
         const parserIterator = parseUpstreamStream(reader);
 
@@ -266,7 +282,6 @@ async function handleChat(req: Request): Promise<Response> {
             });
             return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
         } else {
-            // Xử lý Non-stream
             let fullContent = "";
             let fullReasoning = "";
             let finalId = payload.id;
@@ -295,29 +310,16 @@ Bun.serve({
     async fetch(req) {
         if (req.method === "OPTIONS") {
             return new Response(null, { 
-                headers: { 
-                    "Access-Control-Allow-Origin": "*", 
-                    "Access-Control-Allow-Methods": "POST, OPTIONS",
-                    "Access-Control-Allow-Headers": "*" 
-                } 
+                headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*" } 
             });
         }
-
         if (API_KEY && req.headers.get("Authorization") !== `Bearer ${API_KEY}`) {
             return Response.json({ error: "Unauthorized" }, { status: 401 });
         }
-
         const url = new URL(req.url);
         if (url.pathname === "/v1/chat/completions" && req.method === "POST") return await handleChat(req);
-        
-        // Mock model list endpoint
-        if (url.pathname === "/v1/models") {
-            return Response.json({ 
-                object: "list", 
-                data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] 
-            });
-        }
+        if (url.pathname === "/v1/models") return Response.json({ object: "list", data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] });
 
-        return new Response("UnlimitedAI Proxy (Release v1.0) Ready");
+        return new Response("UnlimitedAI Proxy (Robust Fix) Ready");
     }
 });
