@@ -7,12 +7,20 @@ const CONFIG = {
     PORT: Number(Bun.env.PORT) || 3000,
     API_KEY: Bun.env.API_KEY,
     UPSTREAM_URL: "https://app.unlimitedai.chat",
-    // User Agent giả lập Chrome trên Windows để giảm thiểu CAPTCHA/Block
-    USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    // [New] Thêm Proxy nếu mạng bị chặn (VD: "socks5h://127.0.0.1:1080")
+    PROXY_URL: Bun.env.PROXY_URL || null, 
+    USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    // [Fix] Header giả lập Chrome chuẩn để qua mặt Cloudflare
+    CHROME_HEADERS: {
+        "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "accept-language": "en-US,en;q=0.9,vi;q=0.8",
+    }
 };
 
 console.log(`🚀 Service starting on port ${CONFIG.PORT}`);
-console.log(`⚡ Mode: Production (Clean & Optimized)`);
+console.log(`⚡ Mode: Production (Fix Cloudflare Block & Auth)`);
 
 // ==========================================
 // 2. TYPES & INTERFACES
@@ -44,12 +52,9 @@ class AuthService {
     private static session: SessionData | null = null;
     private static readonly CACHE_DURATION = 5 * 60 * 1000; // 5 phút
 
-    /**
-     * Trích xuất cookie từ Header (Hỗ trợ cả Bun native và string split)
-     */
     private static parseCookies(headers: Headers): string[] {
         const cookies: string[] = [];
-        // @ts-ignore: Bun specific API check
+        // @ts-ignore
         if (typeof headers.getSetCookie === 'function') {
             // @ts-ignore
             headers.getSetCookie().forEach((c: string) => cookies.push(c.split(';')[0]));
@@ -62,9 +67,6 @@ class AuthService {
         return cookies;
     }
 
-    /**
-     * Lấy Session hợp lệ (Cache hoặc Fetch mới)
-     */
     static async getSession(): Promise<SessionData> {
         if (this.session && Date.now() < this.session.expiresAt) {
             return this.session;
@@ -72,24 +74,30 @@ class AuthService {
 
         console.log("🌐 Refreshing UnlimitedAI session...");
         
+        // [Fix] Cấu hình fetch có headers đầy đủ + Proxy
+        const fetchOpts: any = {
+            headers: { 
+                "user-agent": CONFIG.USER_AGENT, 
+                "referer": CONFIG.UPSTREAM_URL,
+                ...CONFIG.CHROME_HEADERS // [Quan trọng] Thêm header giả lập
+            }
+        };
+        if (CONFIG.PROXY_URL) fetchOpts.proxy = CONFIG.PROXY_URL;
+
         try {
             // Step 1: Get CSRF
-            const csrfRes = await fetch(`${CONFIG.UPSTREAM_URL}/api/auth/csrf`, {
-                headers: { "user-agent": CONFIG.USER_AGENT, "referer": CONFIG.UPSTREAM_URL }
-            });
+            const csrfRes = await fetch(`${CONFIG.UPSTREAM_URL}/api/auth/csrf`, fetchOpts);
             if (!csrfRes.ok) throw new Error(`CSRF Error: ${csrfRes.status}`);
 
             const cookies = this.parseCookies(csrfRes.headers);
             const cookieString = [`NEXT_LOCALE=vi`, ...cookies].join("; ");
 
             // Step 2: Get Token
-            const tokenRes = await fetch(`${CONFIG.UPSTREAM_URL}/api/token`, {
-                headers: {
-                    "cookie": cookieString,
-                    "user-agent": CONFIG.USER_AGENT,
-                    "referer": `${CONFIG.UPSTREAM_URL}/`,
-                }
-            });
+            const tokenOpts = { ...fetchOpts };
+            tokenOpts.headers["cookie"] = cookieString;
+            tokenOpts.headers["referer"] = `${CONFIG.UPSTREAM_URL}/`;
+
+            const tokenRes = await fetch(`${CONFIG.UPSTREAM_URL}/api/token`, tokenOpts);
             if (!tokenRes.ok) throw new Error(`Token Error: ${tokenRes.status}`);
 
             const { token } = await tokenRes.json();
@@ -104,6 +112,8 @@ class AuthService {
             return this.session;
         } catch (err) {
             console.error("❌ Auth Failed:", err);
+            // Clear session cũ nếu lỗi để lần sau thử lại
+            this.session = null;
             throw err;
         }
     }
@@ -114,12 +124,9 @@ class AuthService {
 }
 
 // ==========================================
-// 4. DATA CONVERTER (BUSINESS LOGIC)
+// 4. DATA CONVERTER
 // ==========================================
 class DataConverter {
-    /**
-     * Đệ quy để lấy text từ bất kỳ cấu trúc input nào
-     */
     static extractText(content: any): string {
         if (!content) return "";
         if (typeof content === "string") return content;
@@ -133,32 +140,23 @@ class DataConverter {
         return "";
     }
 
-    /**
-     * Tạo message object đúng chuẩn Server yêu cầu
-     */
     static createMessage(role: string, text: string): ChatMessage {
         return {
             id: crypto.randomUUID(),
             createdAt: new Date().toISOString(),
             role,
             content: text,
-            parts: [{ type: "text", text }] // Server yêu cầu cả content và parts phải sync
+            parts: [{ type: "text", text }]
         };
     }
 
-    /**
-     * Chuyển đổi message từ OpenAI -> UnlimitedAI format
-     * - Merge System Prompt vào User message đầu tiên
-     * - Loại bỏ tin nhắn rỗng (fix lỗi 400)
-     */
     static transformMessages(inputs: any[]): ChatMessage[] {
         const output: ChatMessage[] = [];
         const sysPrompts: string[] = [];
 
-        // Phân loại
         inputs.forEach(m => {
             const text = this.extractText(m.content || m.parts).trim();
-            if (!text) return; // Skip empty messages
+            if (!text) return; 
 
             if (m.role === 'system') {
                 sysPrompts.push(text);
@@ -167,21 +165,16 @@ class DataConverter {
             }
         });
 
-        // Merge System Prompt Logic
         if (sysPrompts.length > 0) {
             const fullSysPrompt = `[System Instructions]:\n${sysPrompts.join("\n\n")}`;
-            
             if (output.length > 0 && output[0].role === 'user') {
-                // Prepend vào user message đầu tiên
                 const newContent = `${fullSysPrompt}\n\n${output[0].content}`;
                 output[0] = this.createMessage('user', newContent);
             } else {
-                // Hoặc tạo message mới nếu chưa có
                 output.unshift(this.createMessage('user', fullSysPrompt));
             }
         }
 
-        // Fallback safety
         if (output.length === 0) {
             output.push(this.createMessage('user', 'Hello'));
         }
@@ -211,16 +204,19 @@ async function* streamTransformer(reader: ReadableStreamDefaultReader<Uint8Array
                 if (!line.trim()) continue;
                 
                 // Parse format: key:value (e.g. 0:"Hello", e:done)
+                // [Fix] Regex linh hoạt hơn cho trường hợp key có khoảng trắng (hiếm gặp nhưng có)
                 const match = line.match(/^([a-z0-9]+):(.+)$/);
                 if (!match) continue;
 
                 const [_, key, val] = match;
                 let cleanVal = val.trim();
 
-                if (key === '0' || key === 'g') { // 0=Content, g=Reasoning
-                    if (cleanVal.startsWith('"') && cleanVal.endsWith('"')) {
+                if (key === '0' || key === 'g') { 
+                    // [Fix] Xử lý an toàn hơn khi cắt quote
+                    if (cleanVal.length >= 2 && cleanVal.startsWith('"') && cleanVal.endsWith('"')) {
                         cleanVal = cleanVal.slice(1, -1);
                     }
+                    // Thay thế newline escaped
                     const content = cleanVal.replace(/\\n/g, "\n");
                     
                     yield { 
@@ -234,7 +230,7 @@ async function* streamTransformer(reader: ReadableStreamDefaultReader<Uint8Array
                             finish_reason: null
                         }]
                     };
-                } else if (key === 'e' || key === 'd') { // End/Done
+                } else if (key === 'e' || key === 'd') {
                     yield {
                         id: messageId,
                         object: "chat.completion.chunk",
@@ -242,12 +238,13 @@ async function* streamTransformer(reader: ReadableStreamDefaultReader<Uint8Array
                         model: "unlimited-ai",
                         choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
                     };
-                    return; // Stop generator
+                    return; 
                 }
             }
         }
     } finally {
-        reader.releaseLock();
+        // [Fix] Giải phóng reader an toàn
+        try { reader.releaseLock(); } catch {}
     }
 }
 
@@ -259,7 +256,6 @@ async function handleChatCompletion(req: Request): Promise<Response> {
         const body: OpenAIPayload = await req.json();
         const session = await AuthService.getSession();
         
-        // Prepare Payload
         const upstreamPayload = {
             messages: DataConverter.transformMessages(body.messages),
             id: crypto.randomUUID(),
@@ -268,8 +264,7 @@ async function handleChatCompletion(req: Request): Promise<Response> {
             selectedStory: null
         };
 
-        // Call Upstream
-        const response = await fetch(`${CONFIG.UPSTREAM_URL}/api/chat`, {
+        const fetchOpts: any = {
             method: "POST",
             headers: {
                 "content-type": "application/json",
@@ -278,18 +273,21 @@ async function handleChatCompletion(req: Request): Promise<Response> {
                 "origin": CONFIG.UPSTREAM_URL,
                 "referer": `${CONFIG.UPSTREAM_URL}/chat/${upstreamPayload.id}`,
                 "user-agent": CONFIG.USER_AGENT,
-                "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"'
+                ...CONFIG.CHROME_HEADERS // [Fix] Đồng bộ Headers
             },
             body: JSON.stringify(upstreamPayload)
-        });
+        };
+        
+        if (CONFIG.PROXY_URL) fetchOpts.proxy = CONFIG.PROXY_URL;
+
+        const response = await fetch(`${CONFIG.UPSTREAM_URL}/api/chat`, fetchOpts);
 
         if (!response.ok) {
             const errorText = await response.text();
             console.error(`🔴 Upstream Error ${response.status}:`, errorText.substring(0, 200));
             
             if (response.status === 401 || response.status === 403) {
+                console.log("⚠️ Auth Invalid. Clearing session.");
                 AuthService.clearSession();
             }
             return Response.json({ error: "Upstream Error", details: errorText }, { status: 500 });
@@ -303,11 +301,18 @@ async function handleChatCompletion(req: Request): Promise<Response> {
                 const encoder = new TextEncoder();
                 const generator = streamTransformer(response.body!.getReader());
 
-                for await (const chunk of generator) {
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                try {
+                    for await (const chunk of generator) {
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    }
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                } catch (e) {
+                    console.error("Stream Error:", e);
+                    const errChunk = JSON.stringify({ error: "Stream interrupted" });
+                    controller.enqueue(encoder.encode(`data: ${errChunk}\n\n`));
+                } finally {
+                    controller.close();
                 }
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                controller.close();
             }
         });
 
@@ -331,7 +336,6 @@ async function handleChatCompletion(req: Request): Promise<Response> {
 Bun.serve({
     port: CONFIG.PORT,
     async fetch(req) {
-        // CORS & Preflight
         if (req.method === "OPTIONS") {
             return new Response(null, {
                 headers: {
@@ -342,14 +346,12 @@ Bun.serve({
             });
         }
 
-        // Auth Check (Optional)
         if (CONFIG.API_KEY && req.headers.get("Authorization") !== `Bearer ${CONFIG.API_KEY}`) {
             return Response.json({ error: "Unauthorized" }, { status: 401 });
         }
 
         const url = new URL(req.url);
 
-        // Routes
         if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
             return await handleChatCompletion(req);
         }
@@ -361,6 +363,6 @@ Bun.serve({
             });
         }
 
-        return new Response("UnlimitedAI Proxy is Running 🚀");
+        return new Response("UnlimitedAI Proxy (Fixed) Ready 🚀");
     }
 });
