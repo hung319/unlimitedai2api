@@ -5,13 +5,21 @@ const PORT = Number(Bun.env.PORT) || 3000;
 const API_KEY = Bun.env.API_KEY; 
 const UPSTREAM_BASE = "https://app.unlimitedai.chat";
 
-// User Agent bắt chước trình duyệt thật (như trong Go project)
+// [CONFIG] Cấu hình xoay vòng Token
+// Số request tối đa trước khi tạo token mới (Mặc định 5)
+const TOKEN_ROTATION_LIMIT = Number(Bun.env.TOKEN_ROTATION_LIMIT) || 5; 
+
+// [CONFIG] Bật/Tắt xoay vòng (Mặc định là TRUE, set "false" để tắt)
+const ENABLE_TOKEN_ROTATION = Bun.env.ENABLE_TOKEN_ROTATION !== "false"; 
+
+// User Agent giả lập
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 console.log(`🚀 Server starting on port ${PORT}`);
 console.log(`🔄 Mode: Native Clone (Based on Go Implementation)`);
+console.log(`⚙️  Config: Rotation is ${ENABLE_TOKEN_ROTATION ? 'ON' : 'OFF'} | Limit: ${TOKEN_ROTATION_LIMIT} reqs`);
 
-// --- 2. TYPES ---
+// --- 2. TYPES & STATE ---
 interface SessionData {
     cookie: string;
     token: string;
@@ -19,8 +27,10 @@ interface SessionData {
 }
 
 let cachedSession: SessionData | null = null;
+let requestCount = 0; // Biến đếm số request hiện tại của token
 
-// --- 3. AUTO-AUTH LOGIC (Giữ nguyên vì đã hoạt động tốt) ---
+// --- 3. AUTO-AUTH LOGIC ---
+
 function parseSetCookies(headers: Headers): string[] {
     const cookies: string[] = [];
     // @ts-ignore
@@ -45,11 +55,22 @@ function parseSetCookies(headers: Headers): string[] {
 }
 
 async function getFreshSession(): Promise<SessionData> {
-    if (cachedSession && Date.now() < cachedSession.expiresAt) {
+    // Điều kiện dùng lại Cache:
+    // 1. Có cache session
+    // 2. Chưa hết hạn (Time)
+    // 3. (Nếu bật Rotation) Số request chưa vượt quá Limit
+    const isUnderLimit = !ENABLE_TOKEN_ROTATION || requestCount < TOKEN_ROTATION_LIMIT;
+
+    if (cachedSession && Date.now() < cachedSession.expiresAt && isUnderLimit) {
         return cachedSession;
     }
 
-    console.log("🌐 Fetching new session from UnlimitedAI...");
+    // Log lý do tạo mới
+    if (ENABLE_TOKEN_ROTATION && requestCount >= TOKEN_ROTATION_LIMIT) {
+        console.log(`♻️  Token usage limit reached (${requestCount}/${TOKEN_ROTATION_LIMIT}). Rotating...`);
+    } else {
+        console.log("🌐 Fetching new session from UnlimitedAI...");
+    }
 
     try {
         const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
@@ -81,8 +102,11 @@ async function getFreshSession(): Promise<SessionData> {
         cachedSession = {
             cookie: cookieString,
             token: apiToken,
-            expiresAt: Date.now() + (5 * 60 * 1000)
+            expiresAt: Date.now() + (5 * 60 * 1000) // Cache 5 phút
         };
+
+        // Reset bộ đếm request mỗi khi có session mới
+        requestCount = 0;
 
         return cachedSession;
     } catch (error) {
@@ -91,9 +115,8 @@ async function getFreshSession(): Promise<SessionData> {
     }
 }
 
-// --- 4. DATA CONVERTERS (GO PROJECT LOGIC) ---
+// --- 4. DATA CONVERTERS ---
 
-// Hàm helper để extract text sạch
 function extractText(content: any): string {
     if (!content) return "";
     if (typeof content === "string") return content;
@@ -108,7 +131,6 @@ function extractText(content: any): string {
     return "";
 }
 
-// Format chuẩn mà Server mong đợi (Giống logic trong Go struct)
 function createMessageObject(role: string, content: string) {
     return {
         id: crypto.randomUUID(),
@@ -127,19 +149,15 @@ function createMessageObject(role: string, content: string) {
 function convertMessages(messages: any[]): any[] {
     const processedMessages: any[] = [];
     
-    // 1. Tách System và Chat
     const sysMsgs = messages.filter(m => m.role === 'system');
     const chatMsgs = messages.filter(m => m.role !== 'system');
 
-    // 2. Gom System Prompt
     let systemInstruction = "";
     if (sysMsgs.length > 0) {
         systemInstruction = sysMsgs.map(m => extractText(m.content)).join("\n\n").trim();
     }
 
-    // 3. Xử lý Chat Messages
     chatMsgs.forEach(m => {
-        // Lấy text từ content hoặc parts
         let rawContent = m.content;
         if ((!rawContent || rawContent.length === 0) && m.parts) {
             rawContent = m.parts;
@@ -147,26 +165,21 @@ function convertMessages(messages: any[]): any[] {
         
         const text = extractText(rawContent).trim();
         
-        // [FIX CRITICAL] Bỏ qua tin nhắn rỗng tuyệt đối để tránh lỗi 400 "Empty message parts"
         if (text.length > 0) {
             processedMessages.push(createMessageObject(m.role, text));
         }
     });
 
-    // 4. Merge System Prompt vào User Message đầu tiên (Logic của Go/Web Client)
     if (systemInstruction.length > 0) {
         if (processedMessages.length > 0 && processedMessages[0].role === 'user') {
             const combinedContent = `[System Instruction]:\n${systemInstruction}\n\n${processedMessages[0].content}`;
-            // Cập nhật lại cả content và parts
             processedMessages[0].content = combinedContent;
             processedMessages[0].parts[0].text = combinedContent;
         } else {
-            // Nếu chưa có tin nhắn nào, tạo mới
             processedMessages.unshift(createMessageObject("user", `[System Instruction]:\n${systemInstruction}`));
         }
     }
 
-    // [Safety Check] Nếu vẫn không có tin nhắn nào (chỉ gửi ảnh hoặc lỗi), thêm dummy
     if (processedMessages.length === 0) {
         processedMessages.push(createMessageObject("user", "Hello"));
     }
@@ -190,8 +203,6 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
 
             for (const line of lines) {
                 if (!line.trim()) continue;
-                // Parse format: data: ... hoặc key:value
-                // UnlimitedAI trả về dạng: 0:"content"\n
                 const match = line.match(/^([a-z0-9]+):(.+)$/);
                 if (!match) continue;
                 const key = match[1];
@@ -201,8 +212,6 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                     if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
                     const content = val.replace(/\\n/g, "\n");
                     yield { type: key === 'g' ? 'reasoning' : 'content', content, id: messageId };
-                } else if (key === 'f') {
-                    // Meta info
                 } else if (key === 'e' || key === 'd') {
                     yield { type: 'done', id: messageId };
                 }
@@ -220,13 +229,17 @@ async function handleChat(req: Request): Promise<Response> {
         const body = await req.json();
         const isStream = body.stream === true;
         
-        // Tự động Auth
+        // 1. Tự động Auth (Sẽ tự rotate nếu count >= limit và ENABLE_TOKEN_ROTATION = true)
         const session = await getFreshSession();
+        
+        // 2. Tăng biến đếm usage
+        requestCount++;
+        if (ENABLE_TOKEN_ROTATION) {
+            console.log(`📊 Request Usage: ${requestCount}/${TOKEN_ROTATION_LIMIT}`);
+        }
 
-        // Convert Messages theo đúng chuẩn Go Project
         const cleanMessages = convertMessages(body.messages);
 
-        // Tạo Payload đầy đủ
         const payload = {
             messages: cleanMessages,
             id: crypto.randomUUID(),
@@ -235,7 +248,6 @@ async function handleChat(req: Request): Promise<Response> {
             selectedStory: null
         };
 
-        // Log kiểm tra cấu trúc
         console.log(`🔵 [DEBUG] Msg Count: ${payload.messages.length} | First Msg Role: ${payload.messages[0]?.role}`);
 
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
@@ -258,13 +270,8 @@ async function handleChat(req: Request): Promise<Response> {
         if (!upstreamRes.ok) {
             const errorText = await upstreamRes.text();
             console.error(`🔴 [UPSTREAM FAIL] Status: ${upstreamRes.status}`);
-            console.error(`🔴 [UPSTREAM FAIL] Body: ${errorText}`);
             
-            // Nếu lỗi do dữ liệu rỗng, in ra để debug
-            if (upstreamRes.status === 400) {
-                 console.log("🔴 [DEBUG] Bad Payload:", JSON.stringify(payload.messages, null, 2));
-            }
-
+            // Xử lý Auth Fail -> Reset cache để lần sau lấy mới
             if (upstreamRes.status === 401 || upstreamRes.status === 403) cachedSession = null;
             
             return Response.json({ error: `Upstream error: ${upstreamRes.status}`, details: errorText }, { status: 500 });
@@ -272,7 +279,6 @@ async function handleChat(req: Request): Promise<Response> {
 
         if (!upstreamRes.body) throw new Error("No body from upstream");
 
-        // Xử lý Stream
         const reader = upstreamRes.body.getReader();
         const parserIterator = parseUpstreamStream(reader);
 
@@ -304,7 +310,6 @@ async function handleChat(req: Request): Promise<Response> {
             });
             return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
         } else {
-            // Xử lý Non-stream
             let fullContent = "";
             let fullReasoning = "";
             let finalId = payload.id;
@@ -338,6 +343,6 @@ Bun.serve({
         if (url.pathname === "/v1/chat/completions" && req.method === "POST") return await handleChat(req);
         if (url.pathname === "/v1/models") return Response.json({ object: "list", data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] });
 
-        return new Response("UnlimitedAI Proxy (Go-Port Version) Ready");
+        return new Response("UnlimitedAI Proxy Ready");
     }
 });
