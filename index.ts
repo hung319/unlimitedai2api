@@ -187,7 +187,7 @@ function convertMessages(messages: any[]): any[] {
     return processedMessages;
 }
 
-// --- 5. STREAM PARSER ---
+// --- 5. STREAM PARSER (DEBUG VERSION) ---
 async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -196,49 +196,81 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
     try {
         while (true) {
             const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
+            if (done) {
+                console.log("🔹 [STREAM] Reader Done.");
+                break;
+            }
+            
+            const chunkText = decoder.decode(value, { stream: true });
+            buffer += chunkText;
+            
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
 
             for (const line of lines) {
                 if (!line.trim()) continue;
+
+                // [DEBUG] In ra dòng đang xử lý
+                console.log(`🔍 [PARSER LINE]: ${line}`);
+
+                // Regex hiện tại: Bắt format "key:value" (Ví dụ: 0:"content")
                 const match = line.match(/^([a-z0-9]+):(.+)$/);
-                if (!match) continue;
+                
+                if (!match) {
+                    console.warn(`⚠️ [PARSER SKIP] Line did not match Regex: ${line}`);
+                    continue;
+                }
+
                 const key = match[1];
                 let val = match[2].trim();
+
+                console.log(`✅ [PARSER MATCH] Key: ${key} | Val Length: ${val.length}`);
 
                 if (key === '0' || key === 'g') {
                     if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
                     const content = val.replace(/\\n/g, "\n");
                     yield { type: key === 'g' ? 'reasoning' : 'content', content, id: messageId };
+                } else if (key === 'f') {
+                    console.log("ℹ️ [PARSER META] Meta info received");
                 } else if (key === 'e' || key === 'd') {
+                    console.log("🏁 [PARSER DONE] End signal received");
                     yield { type: 'done', id: messageId };
                 }
             }
         }
+    } catch (err) {
+        console.error("❌ [STREAM ERROR]", err);
     } finally {
         reader.releaseLock();
     }
 }
 
-// --- 6. MAIN HANDLER ---
+// --- 6. MAIN HANDLER (DEBUG VERSION) ---
 
 async function handleChat(req: Request): Promise<Response> {
     try {
         const body = await req.json();
         const isStream = body.stream === true;
         
-        // 1. Tự động Auth (Sẽ tự rotate nếu count >= limit và ENABLE_TOKEN_ROTATION = true)
+        console.log(`📥 [REQ] Incoming Request | Stream: ${isStream}`);
+
+        // 1. Auth & Rotation
         const session = await getFreshSession();
         
-        // 2. Tăng biến đếm usage
+        // 2. Count
         requestCount++;
         if (ENABLE_TOKEN_ROTATION) {
             console.log(`📊 Request Usage: ${requestCount}/${TOKEN_ROTATION_LIMIT}`);
         }
 
+        // 3. Convert & Payload
         const cleanMessages = convertMessages(body.messages);
+        
+        // [DEBUG] In ra messages cuối cùng gửi đi để kiểm tra có bị rỗng không
+        console.log(`📦 [PAYLOAD] Messages Count: ${cleanMessages.length}`);
+        if (cleanMessages.length > 0) {
+            console.log(`📦 [PAYLOAD SAMPLE] Last Msg: ${JSON.stringify(cleanMessages[cleanMessages.length - 1]).slice(0, 100)}...`);
+        }
 
         const payload = {
             messages: cleanMessages,
@@ -247,8 +279,6 @@ async function handleChat(req: Request): Promise<Response> {
             selectedCharacter: null, 
             selectedStory: null
         };
-
-        console.log(`🔵 [DEBUG] Msg Count: ${payload.messages.length} | First Msg Role: ${payload.messages[0]?.role}`);
 
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
             method: "POST",
@@ -267,13 +297,13 @@ async function handleChat(req: Request): Promise<Response> {
             body: JSON.stringify(payload)
         });
 
+        console.log(`📡 [UPSTREAM] Status: ${upstreamRes.status}`);
+
         if (!upstreamRes.ok) {
             const errorText = await upstreamRes.text();
-            console.error(`🔴 [UPSTREAM FAIL] Status: ${upstreamRes.status}`);
+            console.error(`🔴 [UPSTREAM FAIL] Body: ${errorText}`);
             
-            // Xử lý Auth Fail -> Reset cache để lần sau lấy mới
             if (upstreamRes.status === 401 || upstreamRes.status === 403) cachedSession = null;
-            
             return Response.json({ error: `Upstream error: ${upstreamRes.status}`, details: errorText }, { status: 500 });
         }
 
@@ -285,7 +315,9 @@ async function handleChat(req: Request): Promise<Response> {
         if (isStream) {
             const stream = new ReadableStream({
                 async start(controller) {
+                    let hasData = false;
                     for await (const chunk of parserIterator) {
+                        hasData = true; // Đánh dấu là có dữ liệu
                         if (chunk.type === 'done') {
                             const stopChunk = JSON.stringify({
                                 id: chunk.id, object: "chat.completion.chunk", created: Date.now()/1000,
@@ -305,6 +337,7 @@ async function handleChat(req: Request): Promise<Response> {
                         });
                         controller.enqueue(new TextEncoder().encode(`data: ${jsonChunk}\n\n`));
                     }
+                    if (!hasData) console.warn("⚠️ [STREAM WARNING] Stream ended without yielding any data chunks.");
                     controller.close();
                 }
             });
@@ -313,12 +346,22 @@ async function handleChat(req: Request): Promise<Response> {
             let fullContent = "";
             let fullReasoning = "";
             let finalId = payload.id;
+            
+            console.log("⏳ [NON-STREAM] Buffering response...");
+            
             for await (const chunk of parserIterator) {
                 if (chunk.type === 'content') fullContent += chunk.content;
                 if (chunk.type === 'reasoning') fullReasoning += chunk.content;
                 if (chunk.id) finalId = chunk.id;
                 if (chunk.type === 'done') break;
             }
+            
+            console.log(`✅ [NON-STREAM] Done. Length: ${fullContent.length}`);
+            
+            if (fullContent.length === 0 && fullReasoning.length === 0) {
+                 console.error("🔴 [ERROR] Result is empty!");
+            }
+
             return Response.json({
                 id: finalId, object: "chat.completion", created: Math.floor(Date.now() / 1000),
                 model: "unlimited-ai",
@@ -343,6 +386,6 @@ Bun.serve({
         if (url.pathname === "/v1/chat/completions" && req.method === "POST") return await handleChat(req);
         if (url.pathname === "/v1/models") return Response.json({ object: "list", data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] });
 
-        return new Response("UnlimitedAI Proxy Ready");
+        return new Response("UnlimitedAI Proxy (Debug) Ready");
     }
 });
