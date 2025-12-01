@@ -5,11 +5,17 @@ const PORT = Number(Bun.env.PORT) || 3000;
 const API_KEY = Bun.env.API_KEY; 
 const UPSTREAM_BASE = "https://app.unlimitedai.chat";
 
+// [NEW] Cấu hình xoay vòng Token
+// Mặc định 10 request mới đổi 1 lần để tránh bị chặn (spam tạo token sẽ bị lỗi)
+const TOKEN_ROTATION_LIMIT = Number(Bun.env.TOKEN_ROTATION_LIMIT) || 10; 
+const ENABLE_TOKEN_ROTATION = Bun.env.ENABLE_TOKEN_ROTATION !== "false"; 
+
 // User Agent bắt chước trình duyệt thật (như trong Go project)
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 console.log(`🚀 Server starting on port ${PORT}`);
 console.log(`🔄 Mode: Native Clone (Based on Go Implementation)`);
+console.log(`♻️  Rotation: ${ENABLE_TOKEN_ROTATION ? 'ON' : 'OFF'} (Every ${TOKEN_ROTATION_LIMIT} reqs)`);
 
 // --- 2. TYPES ---
 interface SessionData {
@@ -19,8 +25,10 @@ interface SessionData {
 }
 
 let cachedSession: SessionData | null = null;
+// [NEW] Biến đếm request
+let requestCount = 0;
 
-// --- 3. AUTO-AUTH LOGIC (Giữ nguyên vì đã hoạt động tốt) ---
+// --- 3. AUTO-AUTH LOGIC ---
 function parseSetCookies(headers: Headers): string[] {
     const cookies: string[] = [];
     // @ts-ignore
@@ -45,11 +53,18 @@ function parseSetCookies(headers: Headers): string[] {
 }
 
 async function getFreshSession(): Promise<SessionData> {
-    if (cachedSession && Date.now() < cachedSession.expiresAt) {
+    // [MODIFIED] Logic kiểm tra thêm requestCount
+    const isUnderLimit = !ENABLE_TOKEN_ROTATION || requestCount < TOKEN_ROTATION_LIMIT;
+
+    if (cachedSession && Date.now() < cachedSession.expiresAt && isUnderLimit) {
         return cachedSession;
     }
 
-    console.log("🌐 Fetching new session from UnlimitedAI...");
+    if (ENABLE_TOKEN_ROTATION && requestCount >= TOKEN_ROTATION_LIMIT) {
+        console.log(`♻️  Token usage limit reached (${requestCount}/${TOKEN_ROTATION_LIMIT}). Rotating...`);
+    } else {
+        console.log("🌐 Fetching new session from UnlimitedAI...");
+    }
 
     try {
         const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
@@ -83,6 +98,9 @@ async function getFreshSession(): Promise<SessionData> {
             token: apiToken,
             expiresAt: Date.now() + (5 * 60 * 1000)
         };
+        
+        // [NEW] Reset count
+        requestCount = 0;
 
         return cachedSession;
     } catch (error) {
@@ -197,7 +215,8 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                 const key = match[1];
                 let val = match[2].trim();
 
-                if (key === '0' || key === 'g') {
+                // [UPDATE] Thêm key '3' (Error/System Message) để không bị lỗi rỗng
+                if (key === '0' || key === 'g' || key === '3') {
                     if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
                     const content = val.replace(/\\n/g, "\n");
                     yield { type: key === 'g' ? 'reasoning' : 'content', content, id: messageId };
@@ -222,6 +241,10 @@ async function handleChat(req: Request): Promise<Response> {
         
         // Tự động Auth
         const session = await getFreshSession();
+
+        // [NEW] Tăng biến đếm
+        requestCount++;
+        console.log(`📊 Req: ${requestCount}/${TOKEN_ROTATION_LIMIT}`);
 
         // Convert Messages theo đúng chuẩn Go Project
         const cleanMessages = convertMessages(body.messages);
