@@ -259,6 +259,16 @@ function extractChatContentFromRSC(obj: any): string | null {
             }
         }
         
+        // Check for linked-list RSC patterns (the actual chat response structure)
+        if (obj.diff && Array.isArray(obj.diff) && obj.diff.length >= 2) {
+            // This looks like a linked-list structure: {"diff":[0,"Hello."],"next":"$@4"}
+            const content = obj.diff[1]; // The actual text is at index 1
+            if (typeof content === 'string' && content.trim().length > 0) {
+                console.log(`🔵 [EXTRACT DEBUG] Found linked-list diff content: ${content.substring(0, 200)}...`);
+                return content;
+            }
+        }
+        
         // Check for the actual message content in deeply nested structures
         for (const prop in obj) {
             if (obj.hasOwnProperty(prop)) {
@@ -278,6 +288,9 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
     let messageId = crypto.randomUUID();
     let hasEmittedContent = false;
 
+    // Store parsed objects by key to handle linked-list structures
+    const objectsMap: Record<string, any> = {};
+    
     try {
         while (true) {
             const { done, value } = await reader.read();
@@ -306,29 +319,35 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                 
                 console.log(`🔵 [PARSER DEBUG] Key: ${key}, Value: ${val.substring(0, 100)}...`);
 
-                // [UPDATE] Thêm key '3' (Error/System Message) để không bị lỗi rỗng
-                if (key === '0' || key === 'g' || key === '3') {
+                // Store all objects by key for linked-list processing
+                try {
                     if (val.startsWith('"') && val.endsWith('"')) {
+                        objectsMap[key] = val.slice(1, -1);
+                    } else {
+                        objectsMap[key] = JSON.parse(val);
+                    }
+                } catch (e) {
+                    console.log(`🔵 [PARSER DEBUG] Could not parse key ${key}: ${e.message}`);
+                    objectsMap[key] = val;
+                }
+
+                // Handle different response types based on the key
+                if (key === '0' || key === 'g' || key === '3') {
+                    if (typeof objectsMap[key] === 'string') {
                         // This is a simple string content
-                        val = val.slice(1, -1);
-                        const content = val.replace(/\\n/g, "\n");
+                        const content = objectsMap[key].replace(/\\n/g, "\n");
                         console.log(`🔵 [PARSER DEBUG] Yielding simple content type: ${key === 'g' ? 'reasoning' : 'content'}, content: ${content.substring(0, 100)}...`);
                         hasEmittedContent = true;
                         yield { type: key === 'g' ? 'content' : 'reasoning', content, id: messageId };
                     } else {
                         // This is a complex object - need to extract chat content from it
-                        try {
-                            const parsedObj = JSON.parse(val);
-                            const extractedContent = extractChatContentFromRSC(parsedObj);
-                            if (extractedContent) {
-                                console.log(`🔵 [PARSER DEBUG] Yielding extracted content from complex object (key ${key}): ${extractedContent.substring(0, 100)}...`);
-                                hasEmittedContent = true;
-                                yield { type: key === 'g' ? 'content' : 'reasoning', content: extractedContent, id: messageId };
-                            } else {
-                                console.log(`🔵 [PARSER DEBUG] No chat content extracted from complex object in key ${key}`);
-                            }
-                        } catch (e) {
-                            console.log(`🔵 [PARSER DEBUG] Failed to parse complex object in key ${key}:`, e.message);
+                        const extractedContent = extractChatContentFromRSC(objectsMap[key]);
+                        if (extractedContent) {
+                            console.log(`🔵 [PARSER DEBUG] Yielding extracted content from complex object (key ${key}): ${extractedContent.substring(0, 100)}...`);
+                            hasEmittedContent = true;
+                            yield { type: key === 'g' ? 'content' : 'reasoning', content: extractedContent, id: messageId };
+                        } else {
+                            console.log(`🔵 [PARSER DEBUG] No chat content extracted from complex object in key ${key}`);
                         }
                     }
                 } else if (key === 'f') {
@@ -337,6 +356,25 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                 } else if (key === 'e' || key === 'd') {
                     console.log(`🔵 [PARSER DEBUG] Found completion key: ${key}, has emitted content: ${hasEmittedContent}`);
                     yield { type: 'done', id: messageId };
+                } else if (key.match(/^[0-9]+$/) && typeof objectsMap[key] === 'object' && objectsMap[key]?.diff) {
+                    // This looks like a linked-list response object with diff array
+                    const obj = objectsMap[key];
+                    if (obj.diff && Array.isArray(obj.diff) && obj.diff.length >= 2) {
+                        // Extract the content from diff[1]
+                        const content = obj.diff[1];
+                        if (typeof content === 'string') {
+                            console.log(`🔵 [PARSER DEBUG] Yielding linked-list content from key ${key}: ${content.substring(0, 100)}...`);
+                            hasEmittedContent = true;
+                            yield { type: 'content', content, id: messageId };
+                        }
+                        
+                        // If it has a next pointer, try to continue the chain
+                        if (obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
+                            // Extract the next key to continue the chain
+                            const nextKey = obj.next.substring(2); // Remove "$@"
+                            console.log(`🔵 [PARSER DEBUG] Found next pointer: ${obj.next}, looking for key: ${nextKey}`);
+                        }
+                    }
                 } else {
                     // NEW: Additional key processing that might contain content
                     // In RSC responses, other keys like '6', '9', 'a', etc. might contain content
@@ -344,37 +382,18 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                     
                     // Looking for content in various RSC response structures
                     try {
-                        // First, check if val is a JSON string and parse it
-                        let parsedVal = null;
-                        if (typeof val === 'string' && val.startsWith('{') && val.endsWith('}')) {
-                            parsedVal = JSON.parse(val);
-                        } else if (typeof val === 'string' && val.startsWith('\"[') && val.endsWith(']\"')) {
-                            // Handle escaped JSON array strings
-                            try {
-                                const unescaped = val.slice(1, -1).replace(/\\\\/g, '\\');
-                                parsedVal = JSON.parse(unescaped);
-                            } catch (e) {
-                                // If that fails, try basic unescaping
-                                const unescaped = val.slice(1, -1).replace(/\\\"/g, '"').replace(/\\\\/g, '\\');
-                                try {
-                                    parsedVal = JSON.parse(unescaped);
-                                } catch (e2) {
-                                    // If all parsing fails, continue with original string
-                                }
-                            }
-                        }
-                        
                         // Look for content in parsed structures
-                        if (parsedVal) {
+                        if (objectsMap[key] && typeof objectsMap[key] === 'object') {
                             // Look for common RSC content patterns
-                            const extractedContent = extractChatContentFromRSC(parsedVal);
+                            const extractedContent = extractChatContentFromRSC(objectsMap[key]);
                             if (extractedContent) {
                                 console.log(`🔵 [PARSER DEBUG] Extracted content from complex structure in key ${key}: ${extractedContent.substring(0, 200)}...`);
                                 hasEmittedContent = true;
                                 yield { type: 'content', content: extractedContent, id: messageId };
                             }
-                        } else if (typeof val === 'string') {
+                        } else if (typeof objectsMap[key] === 'string') {
                             // If it's a string but couldn't be parsed, look for patterns
+                            const val = objectsMap[key];
                             // Look for patterns like "Hello." or other response text
                             const contentRegex = /\b([A-Z][^.!?]*[.!?])|([^.!?]*Hello[^.!?]*[.!?])\b/;
                             const contentMatch = val.match(contentRegex);
@@ -396,6 +415,53 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                 }
             }
         }
+        
+        // After processing all lines, try to reconstruct linked-list content
+        // Start with known content keys that have diff arrays
+        const contentKeys = Object.keys(objectsMap).filter(key => 
+            key.match(/^[0-9]+$/) && 
+            typeof objectsMap[key] === 'object' && 
+            objectsMap[key]?.diff
+        );
+        
+        for (const key of contentKeys) {
+            const obj = objectsMap[key];
+            if (obj.diff && Array.isArray(obj.diff) && obj.diff.length >= 2) {
+                const content = obj.diff[1];
+                if (typeof content === 'string' && content.trim().length > 0) {
+                    console.log(`🔵 [PARSER DEBUG] Processing content from key ${key}: ${content.substring(0, 100)}...`);
+                    
+                    // Try to build the full content by following the chain
+                    let fullContent = content;
+                    let currentKey = key;
+                    let chainLength = 0;
+                    
+                    // Follow the chain to build full response
+                    while (objectsMap[currentKey]?.next && chainLength < 20) { // Prevent infinite loops
+                        const nextRef = objectsMap[currentKey].next;
+                        if (typeof nextRef === 'string' && nextRef.startsWith('$@')) {
+                            const nextKey = nextRef.substring(2);
+                            if (objectsMap[nextKey] && objectsMap[nextKey]?.diff && Array.isArray(objectsMap[nextKey].diff) && objectsMap[nextKey].diff.length >= 2) {
+                                const nextContent = objectsMap[nextKey].diff[1];
+                                if (typeof nextContent === 'string' && nextContent.trim().length > 0) {
+                                    fullContent += nextContent;
+                                    console.log(`🔵 [PARSER DEBUG] Added content from chain (key ${nextKey}): ${nextContent.substring(0, 100)}...`);
+                                    currentKey = nextKey;
+                                }
+                            }
+                        }
+                        chainLength++;
+                    }
+                    
+                    if (fullContent.trim().length > 0 && !hasEmittedContent) {
+                        console.log(`🔵 [PARSER DEBUG] Yielding reconstructed content: ${fullContent.substring(0, 200)}...`);
+                        hasEmittedContent = true;
+                        yield { type: 'content', content: fullContent, id: messageId };
+                    }
+                }
+            }
+        }
+        
         console.log(`🔵 [PARSER DEBUG] End of stream - total hasEmittedContent: ${hasEmittedContent}`);
     } finally {
         reader.releaseLock();
@@ -496,7 +562,7 @@ async function handleChat(req: Request): Promise<Response> {
         });
         console.log(`🔵 [DEBUG REQUEST] RSC Payload:`, JSON.stringify(rscPayload));
         
-        const upstreamRes = await fetch(`${UPSTREAM_BASE}/vi`, {
+        const upstreamRes = await fetch(`${UPSTREAM_BASE}/`, {
             method: "POST",
             headers: {
                 "authority": "app.unlimitedai.chat",
@@ -505,9 +571,9 @@ async function handleChat(req: Request): Promise<Response> {
                 "cookie": session.cookie,
                 "x-api-token": session.token,
                 "next-action": NEXT_ACTION_ID,
-                "next-router-state-tree": "%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22vi%22%2C%22d%22%5D%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D", // URL encoded router state from curl
+                "next-router-state-tree": "%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22en%22%2C%22d%22%5D%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D", // URL encoded router state from working curl
                 "origin": UPSTREAM_BASE,
-                "referer": `${UPSTREAM_BASE}/vi`,
+                "referer": `${UPSTREAM_BASE}/`,
                 "user-agent": USER_AGENT,
                 "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
                 "sec-ch-ua-mobile": "?1",
@@ -515,7 +581,7 @@ async function handleChat(req: Request): Promise<Response> {
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
-                "accept-language": "vi-VN,vi;q=0.9"
+                "accept-language": "vi-VN,vi;q=0.9" // Using appropriate language
             },
             body: JSON.stringify(rscPayload)
         });
@@ -627,7 +693,7 @@ async function handleChat(req: Request): Promise<Response> {
 Bun.serve({
     port: PORT,
     async fetch(req) {
-        if (req.method === "OPTIONS") return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*" } });
+        if (req.method === "OPTIONS") return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Control-Allow-Headers": "*" } });
         if (API_KEY && req.headers.get("Authorization") !== `Bearer ${API_KEY}`) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
         const url = new URL(req.url);
