@@ -197,7 +197,6 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
     const decoder = new TextDecoder();
     let buffer = "";
     let messageId = crypto.randomUUID();
-    let hasEmittedContent = false;
 
     try {
         while (true) {
@@ -205,148 +204,69 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
             if (done) break;
             
             const decodedChunk = decoder.decode(value, { stream: true });
-            console.log(`🔵 [PARSER DEBUG] Raw chunk: ${decodedChunk.substring(0, 200)}...`); // Log first 200 chars
+            // console.log(`🔵 [PARSER DEBUG] Raw chunk: ${decodedChunk.substring(0, 200)}...`); // Log first 200 chars
             
             buffer += decodedChunk;
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
 
             for (const line of lines) {
-                console.log(`🔵 [PARSER DEBUG] Processing line: ${line.substring(0, 100)}`); // Log the line being processed
+                // console.log(`🔵 [PARSER DEBUG] Processing line: ${line.substring(0, 100)}`); // Log the line being processed
                 
                 if (!line.trim()) continue;
                 // Parse format: data: ... hoặc key:value
                 // UnlimitedAI trả về dạng: 0:"content"\n
                 const match = line.match(/^([a-z0-9]+):(.+)$/);
                 if (!match) {
-                    console.log(`🔵 [PARSER DEBUG] Line doesn't match pattern: ${line.substring(0, 100)}`);
+                    // console.log(`🔵 [PARSER DEBUG] Line doesn't match pattern: ${line.substring(0, 100)}`);
                     continue;
                 }
                 const key = match[1];
                 let val = match[2].trim();
                 
-                console.log(`🔵 [PARSER DEBUG] Key: ${key}, Value: ${val.substring(0, 100)}...`);
+                // console.log(`🔵 [PARSER DEBUG] Key: ${key}, Value: ${val.substring(0, 100)}...`);
 
                 // [UPDATE] Thêm key '3' (Error/System Message) để không bị lỗi rỗng
                 if (key === '0' || key === 'g' || key === '3') {
                     if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
                     const content = val.replace(/\\n/g, "\n");
-                    console.log(`🔵 [PARSER DEBUG] Yielding content type: ${key === 'g' ? 'reasoning' : 'content'}, content: ${content.substring(0, 100)}...`);
-                    hasEmittedContent = true;
-                    yield { type: key === 'g' ? 'content' : 'reasoning', content, id: messageId };
+                    // console.log(`🔵 [PARSER DEBUG] Yielding content type: ${key === 'g' ? 'reasoning' : 'content'}, content: ${content.substring(0, 100)}...`);
+                    yield { type: key === 'g' ? 'reasoning' : 'content', content, id: messageId };
                 } else if (key === 'f') {
-                    console.log(`🔵 [PARSER DEBUG] Found 'f' key - metadata`);
+                    // console.log(`🔵 [PARSER DEBUG] Found 'f' key - metadata`);
                     // Meta info
                 } else if (key === 'e' || key === 'd') {
-                    console.log(`🔵 [PARSER DEBUG] Found completion key: ${key}, has emitted content: ${hasEmittedContent}`);
+                    // console.log(`🔵 [PARSER DEBUG] Found completion key: ${key}`);
                     yield { type: 'done', id: messageId };
                 } else {
                     // NEW: Additional key processing that might contain content
                     // In RSC responses, other keys like '6', '9', 'a', etc. might contain content
-                    console.log(`🔵 [PARSER DEBUG] Found unhandled key: ${key}, value: ${val.substring(0, 100)}...`);
+                    // console.log(`🔵 [PARSER DEBUG] Found unhandled key: ${key}, value: ${val.substring(0, 100)}...`);
+                    
+                    // Attempt to extract potential text content from other types of values that might contain chat responses
+                    // Common RSC formats might have objects with text in "a" values that look like: "a":"$@1"... or other structures 
+                    if (typeof val === 'string' && val.includes('Hello')) { // If contains potential response text
+                        // console.log(`🔵 [PARSER DEBUG] Potential content found in key ${key}: ${val.substring(0, 200)}...`);
+                    }
                     
                     // Looking for content in various RSC response structures
-                    try {
-                        // First, check if val is a JSON string and parse it
-                        let parsedVal = null;
-                        if (typeof val === 'string' && val.startsWith('{') && val.endsWith('}')) {
-                            parsedVal = JSON.parse(val);
-                        } else if (typeof val === 'string' && val.startsWith('\"[') && val.endsWith(']\"')) {
-                            // Handle escaped JSON array strings
-                            try {
-                                const unescaped = val.slice(1, -1).replace(/\\\\/g, '\\');
-                                parsedVal = JSON.parse(unescaped);
-                            } catch (e) {
-                                // If that fails, try basic unescaping
-                                const unescaped = val.slice(1, -1).replace(/\\\"/g, '"').replace(/\\\\/g, '\\');
-                                try {
-                                    parsedVal = JSON.parse(unescaped);
-                                } catch (e2) {
-                                    // If all parsing fails, continue with original string
+                    if (typeof val === 'string' && val.includes('children')) {
+                        // This might be a React component structure containing the actual content
+                        // Try to extract text content from it
+                        const textMatches = val.match(/"text":"([^"]+)"/g);
+                        if (textMatches) {
+                            for (const match of textMatches) {
+                                const textContent = match.match(/"text":"([^"]+)"/);
+                                if (textContent && textContent[1]) {
+                                    // console.log(`🔵 [PARSER DEBUG] Extracted content from React structure: ${textContent[1]}`);
+                                    yield { type: 'content', content: textContent[1], id: messageId };
                                 }
                             }
                         }
-                        
-                        // Look for content in parsed structures
-                        if (parsedVal) {
-                            // Look for common RSC content patterns
-                            const findContentInStructure = (obj: any): string | null => {
-                                if (!obj) return null;
-                                
-                                // If it's a string that looks like content
-                                if (typeof obj === 'string') {
-                                    if (obj.length > 10 && obj.length < 1000) { // Reasonable content length
-                                        // Check if it's not a control string
-                                        if (!obj.startsWith('$') && !obj.includes('$@') && !obj.includes('__PAGE__')) {
-                                            console.log(`🔵 [PARSER DEBUG] Found potential string content: ${obj.substring(0, 200)}...`);
-                                            return obj;
-                                        }
-                                    }
-                                    return null;
-                                }
-                                
-                                // If it's an array, search elements
-                                if (Array.isArray(obj)) {
-                                    for (const item of obj) {
-                                        const result = findContentInStructure(item);
-                                        if (result) return result;
-                                    }
-                                    return null;
-                                }
-                                
-                                // If it's an object, search properties
-                                if (typeof obj === 'object') {
-                                    // Prioritize content-related keys
-                                    for (const key of ['text', 'content', 'children', 'value', 'data']) {
-                                        if (obj[key]) {
-                                            const result = findContentInStructure(obj[key]);
-                                            if (result) {
-                                                console.log(`🔵 [PARSER DEBUG] Found content in ${key} field: ${result.substring(0, 200)}...`);
-                                                return result;
-                                            }
-                                        }
-                                    }
-                                    // Search all values
-                                    for (const subKey in obj) {
-                                        if (obj.hasOwnProperty(subKey)) {
-                                            const result = findContentInStructure(obj[subKey]);
-                                            if (result) return result;
-                                        }
-                                    }
-                                }
-                                return null;
-                            };
-                            
-                            const extractedContent = findContentInStructure(parsedVal);
-                            if (extractedContent) {
-                                console.log(`🔵 [PARSER DEBUG] Extracted content from complex structure in key ${key}: ${extractedContent.substring(0, 200)}...`);
-                                hasEmittedContent = true;
-                                yield { type: 'content', content: extractedContent, id: messageId };
-                            }
-                        } else if (typeof val === 'string') {
-                            // If it's a string but couldn't be parsed, look for patterns
-                            // Look for patterns like "Hello." or other response text
-                            const contentRegex = /\b([A-Z][^.!?]*[.!?])|([^.!?]*Hello[^.!?]*[.!?])\b/;
-                            const contentMatch = val.match(contentRegex);
-                            if (contentMatch) {
-                                console.log(`🔵 [PARSER DEBUG] Found potential content pattern in key ${key}: ${contentMatch[0].substring(0, 200)}...`);
-                                hasEmittedContent = true;
-                                yield { type: 'content', content: contentMatch[0], id: messageId };
-                            } else if (val.length > 20 && val.length < 1000 && val.includes(' ') && !val.includes('$') && !val.includes('@') && !val.includes('__')) {
-                                // Potential content that doesn't match other patterns
-                                console.log(`🔵 [PARSER DEBUG] Found potential content in key ${key}: ${val.substring(0, 200)}...`);
-                                hasEmittedContent = true;
-                                yield { type: 'content', content: val, id: messageId };
-                            }
-                        }
-                    } catch (parseError) {
-                        // If parsing fails, just continue
-                        console.log(`🔵 [PARSER DEBUG] Parse error for key ${key}, value: ${val.substring(0, 100)}..., error:`, parseError.message);
                     }
                 }
             }
         }
-        console.log(`🔵 [PARSER DEBUG] End of stream - total hasEmittedContent: ${hasEmittedContent}`);
     } finally {
         reader.releaseLock();
     }
@@ -493,25 +413,12 @@ async function handleChat(req: Request): Promise<Response> {
             throw new Error("No body from upstream");
         }
 
-        // Read all response text first for debugging and proper content extraction
-        const responseText = await upstreamRes.text();
-        console.log(`🔵 [RESPONSE DEBUG] Raw response: ${responseText.substring(0, 500)}...`);
-        console.log(`🔵 [RESPONSE DEBUG] Response length: ${responseText.length}`);
-        
-        // Convert response to stream for parsing
-        const stream = new ReadableStream({
-            start(controller) {
-                controller.enqueue(new TextEncoder().encode(responseText));
-                controller.close();
-            }
-        });
-        
         // Xử lý Stream
-        const reader = stream.getReader();
+        const reader = upstreamRes.body.getReader();
         const parserIterator = parseUpstreamStream(reader);
 
         if (isStream) {
-            const resultStream = new ReadableStream({
+            const stream = new ReadableStream({
                 async start(controller) {
                     let hasContent = false;
                     for await (const chunk of parserIterator) {
@@ -541,7 +448,7 @@ async function handleChat(req: Request): Promise<Response> {
                     controller.close();
                 }
             });
-            return new Response(resultStream, { headers: { "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
+            return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
         } else {
             // Xử lý Non-stream
             let fullContent = "";
@@ -568,7 +475,6 @@ async function handleChat(req: Request): Promise<Response> {
 
     } catch (e: any) {
         console.error("❌ Handler Error:", e.message);
-        console.error("❌ Handler Stack:", e.stack);
         return Response.json({ error: e.message }, { status: 500 });
     }
 }
