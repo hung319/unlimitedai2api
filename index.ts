@@ -74,7 +74,7 @@ async function getFreshSession(): Promise<SessionData> {
         if (!csrfResp.ok) throw new Error(`CSRF Fetch Failed: ${csrfResp.status}`);
 
         const serverCookies = parseSetCookies(csrfResp.headers);
-        const cookieList = [`NEXT_LOCALE=vi`, ...serverCookies];
+        const cookieList = [`NEXT_LOCALE=en`, ...serverCookies];  // Changed to en locale
         const cookieString = cookieList.join("; ");
 
         const tokenResp = await fetch(`${UPSTREAM_BASE}/api/token`, {
@@ -553,12 +553,12 @@ async function handleChat(req: Request): Promise<Response> {
         }];
         
         // Log the request details for debugging
-        console.log(`🔵 [DEBUG REQUEST] Making RSC request to: ${UPSTREAM_BASE}/vi`);
+        console.log(`🔵 [DEBUG REQUEST] Making RSC request to: ${UPSTREAM_BASE}/`);
         console.log(`🔵 [DEBUG REQUEST] Headers:`, {
             "content-type": "text/plain;charset=UTF-8",
             "accept": "text/x-component",
             "next-action": NEXT_ACTION_ID,
-            "referer": `${UPSTREAM_BASE}/vi`
+            "referer": `${UPSTREAM_BASE}/`
         });
         console.log(`🔵 [DEBUG REQUEST] RSC Payload:`, JSON.stringify(rscPayload));
         
@@ -581,7 +581,7 @@ async function handleChat(req: Request): Promise<Response> {
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
-                "accept-language": "vi-VN,vi;q=0.9" // Using appropriate language
+                "accept-language": "vi-VN,vi;q=0.9" // Using appropriate language but router state uses en
             },
             body: JSON.stringify(rscPayload)
         });
