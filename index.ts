@@ -246,6 +246,46 @@ async function handleChat(req: Request): Promise<Response> {
         requestCount++;
         console.log(`📊 Req: ${requestCount}/${TOKEN_ROTATION_LIMIT}`);
 
+        // Define valid models based on the UI data
+        const validModels = ["chat-model-reasoning", "chat-model-reasoning-with-search"];
+        
+        // Validate and select model
+        let selectedModel = body.model || "chat-model-reasoning-with-search";
+        
+        // If provided model is not in valid list, fall back to default
+        if (!validModels.includes(selectedModel)) {
+            console.log(`⚠️  Model ${selectedModel} not in valid list, using default`);
+            selectedModel = "chat-model-reasoning-with-search"; // default to more capable model
+        }
+        
+        // Optional: Validate model against upstream models (commented out for performance, can be enabled if needed)
+        /*
+        try {
+            const modelsRes = await fetch(`${UPSTREAM_BASE}/api/models`, {
+                headers: {
+                    "cookie": session.cookie,
+                    "x-api-token": session.token,
+                    "user-agent": USER_AGENT,
+                    "referer": UPSTREAM_BASE,
+                }
+            });
+            
+            if (modelsRes.ok) {
+                const availableModels = await modelsRes.json();
+                const modelExists = Array.isArray(availableModels) && 
+                    (availableModels.some(m => m.id === selectedModel) || availableModels.includes(selectedModel));
+                
+                if (!modelExists) {
+                    console.log(`⚠️  Model ${selectedModel} not available upstream, falling back to default`);
+                    selectedModel = "chat-model-reasoning-with-search"; // fallback to default
+                }
+            }
+        } catch (e) {
+            console.error("Failed to validate model against upstream:", e);
+            // Continue with selectedModel even if validation failed
+        }
+        */
+
         // Convert Messages theo đúng chuẩn Go Project
         const cleanMessages = convertMessages(body.messages);
 
@@ -253,7 +293,7 @@ async function handleChat(req: Request): Promise<Response> {
         const payload = {
             messages: cleanMessages,
             id: crypto.randomUUID(),
-            selectedChatModel: body.model || "chat-model-reasoning",
+            selectedChatModel: selectedModel,
             selectedCharacter: null, 
             selectedStory: null
         };
@@ -359,7 +399,40 @@ Bun.serve({
 
         const url = new URL(req.url);
         if (url.pathname === "/v1/chat/completions" && req.method === "POST") return await handleChat(req);
-        if (url.pathname === "/v1/models") return Response.json({ object: "list", data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }] });
+        if (url.pathname === "/v1/models") {
+            // Fetch actual models from upstream if requested
+            if (url.searchParams.get('upstream') === 'true') {
+                try {
+                    const session = await getFreshSession();
+                    const upstreamModelsRes = await fetch(`${UPSTREAM_BASE}/api/models`, {
+                        headers: {
+                            "cookie": session.cookie,
+                            "x-api-token": session.token,
+                            "user-agent": USER_AGENT,
+                            "referer": UPSTREAM_BASE,
+                        }
+                    });
+                    
+                    if (upstreamModelsRes.ok) {
+                        const upstreamModels = await upstreamModelsRes.json();
+                        // Convert upstream format to OpenAI format
+                        if (upstreamModels && Array.isArray(upstreamModels)) {
+                            const openAIFormat = upstreamModels.map(model => ({
+                                id: model.id || model,
+                                object: "model",
+                                created: 0,
+                                owned_by: "unlimited"
+                            }));
+                            return Response.json({ object: "list", data: openAIFormat });
+                        }
+                    }
+                } catch (e) {
+                    console.error("Failed to fetch upstream models:", e);
+                }
+            }
+            // Default response with known models
+            return Response.json({ object: "list", data: [{ id: "chat-model-reasoning", object: "model", created: 0, owned_by: "unlimited" }, { id: "chat-model-reasoning-with-search", object: "model", created: 0, owned_by: "unlimited" }] });
+        }
 
         return new Response("UnlimitedAI Proxy (Go-Port Version) Ready");
     }
