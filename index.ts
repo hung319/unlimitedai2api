@@ -301,21 +301,43 @@ async function handleChat(req: Request): Promise<Response> {
         // Log kiểm tra cấu trúc
         console.log(`🔵 [DEBUG] Msg Count: ${payload.messages.length} | First Msg Role: ${payload.messages[0]?.role}`);
 
-        const upstreamRes = await fetch(`${UPSTREAM_BASE}/api/chat`, {
+        // Determine the Next.js RSC action ID from the selected model
+        // Using the action ID from the provided curl request
+        const NEXT_ACTION_ID = "40713570958bf1accf30e8d3ddb17e7948e6c379fa"; // This is from the curl example
+        
+        // Format the payload to match Next.js RSC format from the curl request
+        const rscPayload = [{
+            chatId: payload.id,
+            messages: payload.messages,
+            selectedChatModel: payload.selectedChatModel,
+            selectedCharacter: payload.selectedCharacter,
+            selectedStory: payload.selectedStory,
+            turnstileToken: "$undefined",  // This was in the original curl
+            deviceId: "796cacff-656b-4e0d-aa17-08810059f1ab"  // This was in the original curl (example ID)
+        }];
+        
+        const upstreamRes = await fetch(`${UPSTREAM_BASE}/vi`, {
             method: "POST",
             headers: {
                 "authority": "app.unlimitedai.chat",
-                "content-type": "application/json",
+                "content-type": "text/plain;charset=UTF-8",
+                "accept": "text/x-component",
                 "cookie": session.cookie,
                 "x-api-token": session.token,
+                "next-action": NEXT_ACTION_ID,
+                "next-router-state-tree": "%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22vi%22%2C%22d%22%5D%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D", // URL encoded router state from curl
                 "origin": UPSTREAM_BASE,
-                "referer": `${UPSTREAM_BASE}/chat/${payload.id}`,
+                "referer": `${UPSTREAM_BASE}/vi`,
                 "user-agent": USER_AGENT,
-                "sec-ch-ua": '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"'
+                "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+                "sec-ch-ua-mobile": "?1",
+                "sec-ch-ua-platform": '"Android"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "accept-language": "vi-VN,vi;q=0.9"
             },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(rscPayload)
         });
 
         if (!upstreamRes.ok) {
