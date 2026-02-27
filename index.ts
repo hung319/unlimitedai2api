@@ -192,6 +192,85 @@ function convertMessages(messages: any[]): any[] {
     return processedMessages;
 }
 
+// Helper function to extract chat content from RSC structures
+function extractChatContentFromRSC(obj: any): string | null {
+    if (!obj) return null;
+    
+    // If it's a string that looks like chat content
+    if (typeof obj === 'string') {
+        // Look for actual chat responses, not React component markers
+        if (obj.length > 3 && obj.length < 2000 && 
+            !obj.startsWith('$') && 
+            !obj.startsWith('__') && 
+            !obj.includes('__PAGE__') && 
+            !obj.includes('$@') &&
+            (obj.includes('.') || obj.includes('!') || obj.includes('?') || obj.includes(' ') || obj.includes('\\n'))) {
+            return obj;
+        }
+        return null;
+    }
+    
+    // If it's an array, check if it represents a component with children that might contain text
+    if (Array.isArray(obj)) {
+        if (obj.length >= 3 && typeof obj[0] === 'string' && obj[0] === '$') {
+            // This looks like a React component: ["$", "componentName", props]
+            if (obj.length > 2 && obj[2] && typeof obj[2] === 'object') {
+                // Check props for text content
+                const props = obj[2];
+                if (props.children) {
+                    const childContent = extractChatContentFromRSC(props.children);
+                    if (childContent) return childContent;
+                }
+            }
+        }
+        
+        // Look through array elements for content
+        for (const item of obj) {
+            const result = extractChatContentFromRSC(item);
+            if (result) return result;
+        }
+        return null;
+    }
+    
+    // If it's an object, search for content in common React component patterns
+    if (typeof obj === 'object') {
+        // Check for direct text content in common properties
+        const contentKeys = ['text', 'children', 'content', 'value', 'data', 'message', 'content'];
+        for (const key of contentKeys) {
+            if (obj[key] !== undefined && obj[key] !== null) {
+                const result = extractChatContentFromRSC(obj[key]);
+                if (result) {
+                    console.log(`🔵 [EXTRACT DEBUG] Found content in key '${key}': ${result.substring(0, 200)}...`);
+                    return result;
+                }
+            }
+        }
+        
+        // Special handling for common RSC patterns
+        // Pattern: { a: "$@1", f: [...] } - where the actual content is in the f array
+        if (obj.a && obj.f && Array.isArray(obj.f)) {
+            console.log(`🔵 [EXTRACT DEBUG] Found RSC pattern with 'a' and 'f' keys`);
+            for (const item of obj.f) {
+                const result = extractChatContentFromRSC(item);
+                if (result) {
+                    console.log(`🔵 [EXTRACT DEBUG] Extracted from RSC f array: ${result.substring(0, 200)}...`);
+                    return result;
+                }
+            }
+        }
+        
+        // Check for the actual message content in deeply nested structures
+        for (const prop in obj) {
+            if (obj.hasOwnProperty(prop)) {
+                const result = extractChatContentFromRSC(obj[prop]);
+                if (result) return result;
+            }
+        }
+    }
+    
+    return null;
+}
+
 // --- 5. STREAM PARSER ---
 async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
@@ -229,14 +308,32 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
 
                 // [UPDATE] Thêm key '3' (Error/System Message) để không bị lỗi rỗng
                 if (key === '0' || key === 'g' || key === '3') {
-                    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
-                    const content = val.replace(/\\n/g, "\n");
-                    console.log(`🔵 [PARSER DEBUG] Yielding content type: ${key === 'g' ? 'reasoning' : 'content'}, content: ${content.substring(0, 100)}...`);
-                    hasEmittedContent = true;
-                    yield { type: key === 'g' ? 'content' : 'reasoning', content, id: messageId };
+                    if (val.startsWith('"') && val.endsWith('"')) {
+                        // This is a simple string content
+                        val = val.slice(1, -1);
+                        const content = val.replace(/\\n/g, "\n");
+                        console.log(`🔵 [PARSER DEBUG] Yielding simple content type: ${key === 'g' ? 'reasoning' : 'content'}, content: ${content.substring(0, 100)}...`);
+                        hasEmittedContent = true;
+                        yield { type: key === 'g' ? 'content' : 'reasoning', content, id: messageId };
+                    } else {
+                        // This is a complex object - need to extract chat content from it
+                        try {
+                            const parsedObj = JSON.parse(val);
+                            const extractedContent = extractChatContentFromRSC(parsedObj);
+                            if (extractedContent) {
+                                console.log(`🔵 [PARSER DEBUG] Yielding extracted content from complex object (key ${key}): ${extractedContent.substring(0, 100)}...`);
+                                hasEmittedContent = true;
+                                yield { type: key === 'g' ? 'content' : 'reasoning', content: extractedContent, id: messageId };
+                            } else {
+                                console.log(`🔵 [PARSER DEBUG] No chat content extracted from complex object in key ${key}`);
+                            }
+                        } catch (e) {
+                            console.log(`🔵 [PARSER DEBUG] Failed to parse complex object in key ${key}:`, e.message);
+                        }
+                    }
                 } else if (key === 'f') {
-                    console.log(`🔵 [PARSER DEBUG] Found 'f' key - metadata`);
-                    // Meta info
+                    console.log(`🔵 [PARSER DEBUG] Found 'f' key - usually metadata`);
+                    // Meta info - keep for now
                 } else if (key === 'e' || key === 'd') {
                     console.log(`🔵 [PARSER DEBUG] Found completion key: ${key}, has emitted content: ${hasEmittedContent}`);
                     yield { type: 'done', id: messageId };
@@ -270,54 +367,7 @@ async function* parseUpstreamStream(reader: ReadableStreamDefaultReader<Uint8Arr
                         // Look for content in parsed structures
                         if (parsedVal) {
                             // Look for common RSC content patterns
-                            const findContentInStructure = (obj: any): string | null => {
-                                if (!obj) return null;
-                                
-                                // If it's a string that looks like content
-                                if (typeof obj === 'string') {
-                                    if (obj.length > 10 && obj.length < 1000) { // Reasonable content length
-                                        // Check if it's not a control string
-                                        if (!obj.startsWith('$') && !obj.includes('$@') && !obj.includes('__PAGE__')) {
-                                            console.log(`🔵 [PARSER DEBUG] Found potential string content: ${obj.substring(0, 200)}...`);
-                                            return obj;
-                                        }
-                                    }
-                                    return null;
-                                }
-                                
-                                // If it's an array, search elements
-                                if (Array.isArray(obj)) {
-                                    for (const item of obj) {
-                                        const result = findContentInStructure(item);
-                                        if (result) return result;
-                                    }
-                                    return null;
-                                }
-                                
-                                // If it's an object, search properties
-                                if (typeof obj === 'object') {
-                                    // Prioritize content-related keys
-                                    for (const key of ['text', 'content', 'children', 'value', 'data']) {
-                                        if (obj[key]) {
-                                            const result = findContentInStructure(obj[key]);
-                                            if (result) {
-                                                console.log(`🔵 [PARSER DEBUG] Found content in ${key} field: ${result.substring(0, 200)}...`);
-                                                return result;
-                                            }
-                                        }
-                                    }
-                                    // Search all values
-                                    for (const subKey in obj) {
-                                        if (obj.hasOwnProperty(subKey)) {
-                                            const result = findContentInStructure(obj[subKey]);
-                                            if (result) return result;
-                                        }
-                                    }
-                                }
-                                return null;
-                            };
-                            
-                            const extractedContent = findContentInStructure(parsedVal);
+                            const extractedContent = extractChatContentFromRSC(parsedVal);
                             if (extractedContent) {
                                 console.log(`🔵 [PARSER DEBUG] Extracted content from complex structure in key ${key}: ${extractedContent.substring(0, 200)}...`);
                                 hasEmittedContent = true;
