@@ -9,30 +9,67 @@ const NEXT_ACTION_ID = "40713570958bf1accf30e8d3ddb17e7948e6c379fa";
 
 console.log(`🚀 Server starting on port ${PORT}`);
 
-// --- 2. AUTH & SESSION ---
-async function getCookie(chatId: string): Promise<string> {
-    // This is a simplified cookie acquisition based on the working cURL.
-    // In a real scenario, this would involve a more robust login/session flow.
-    const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
+// --- 2. AUTH & SESSION (Robust) ---
+function parseSetCookies(headers: Headers): string[] {
+    const cookies: string[] = [];
+    // Bun's Header object has a specific getSetCookie() method
+    // @ts-ignore
+    if (typeof headers.getSetCookie === 'function') {
+        // @ts-ignore
+        const rawCookies = headers.getSetCookie();
+        rawCookies.forEach((c: string) => {
+            cookies.push(c.split(';')[0]);
+        });
+    } else { // Fallback for other environments
+        const cookieHeader = headers.get("set-cookie");
+        if (cookieHeader) {
+            cookieHeader.split(',').forEach(c => {
+                cookies.push(c.split(';')[0]);
+            });
+        }
+    }
+    return cookies;
+}
+
+async function getFullSessionCookie(chatId: string): Promise<string> {
+    console.log("[SESSION] Getting full session cookie...");
+    
+    // 1. Visit homepage to get initial cookies
+    const homeResp = await fetch(UPSTREAM_BASE, {
         headers: { "user-agent": USER_AGENT }
     });
-    const csrfCookies = csrfResp.headers.get("set-cookie") || "";
-    
-    // Extract csrf token
-    const csrfTokenMatch = csrfCookies.match(/__Host-authjs\.csrf-token=([^;]+)/);
-    const csrfToken = csrfTokenMatch ? csrfTokenMatch[1] : "";
+    const initialCookies = parseSetCookies(homeResp.headers);
+    console.log("[SESSION] Initial cookies from homepage:", initialCookies);
 
-    // Build the cookie string exactly like the working example
-    const cookies = [
-        `_cfuvid=your_cfuvid_cookie`, // Replace with actual if needed
-        `u_device_id=cf8e2bd4-464b-491d-81f3-c887e662d114`,
+    // 2. Fetch CSRF token using initial cookies
+    const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
+        headers: {
+            "user-agent": USER_AGENT,
+            "cookie": initialCookies.join('; ')
+        }
+    });
+    const csrfCookies = parseSetCookies(csrfResp.headers);
+    console.log("[SESSION] CSRF cookies:", csrfCookies);
+
+    // 3. Combine all cookies
+    const allCookies = [...new Set([...initialCookies, ...csrfCookies])];
+
+    // 4. Ensure necessary cookies are present
+    if (!allCookies.some(c => c.includes('__Host-authjs.csrf-token'))) {
+        console.error("[SESSION-ERROR] CSRF token not found in cookies!");
+    }
+    
+    // 5. Add the dynamic cookies required by the working cURL
+    const finalCookieList = [
+        ...allCookies,
         `home_chat_id=${chatId}`,
-        `__Secure-authjs.callback-url=https%3A%2F%2Fapp.unlimitedai.chat`,
-        `__Host-authjs.csrf-token=${csrfToken}`,
-        `NEXT_LOCALE=en`
+        `NEXT_LOCALE=en`,
     ];
 
-    return cookies.join('; ');
+    const finalCookieString = [...new Set(finalCookieList)].join('; ');
+    console.log("[SESSION] Final cookie string for request:", finalCookieString);
+
+    return finalCookieString;
 }
 
 
@@ -66,15 +103,14 @@ async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Arr
                 if (val.startsWith('"') && val.endsWith('"')) {
                     objectsMap[key] = val.slice(1, -1);
                 } else {
-                    objectsMap[key] = val; // Store as is if not JSON
+                    objectsMap[key] = val; 
                 }
             }
         }
     }
 
-    // After parsing all lines, reconstruct the full message from the linked-list
     let fullContent = "";
-    let currentKey = '2'; // Start of the chain from the working example
+    let currentKey = '2'; 
     const visitedKeys = new Set();
 
     while (objectsMap[currentKey] && !visitedKeys.has(currentKey)) {
@@ -92,7 +128,7 @@ async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Arr
         if (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
             currentKey = obj.next.substring(2);
         } else {
-            break; // End of chain
+            break;
         }
     }
 
@@ -100,16 +136,7 @@ async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Arr
         console.log(`[PARSER] Reconstructed full content: ${fullContent}`);
         yield { type: 'content', content: fullContent, id: crypto.randomUUID() };
     } else {
-         console.log("[PARSER] No linked-list content found. Checking for other content.");
-         // Fallback to searching for any string that looks like a response.
-         for(const key in objectsMap) {
-             const value = objectsMap[key];
-             if(typeof value === 'string' && value.length > 20 && !value.startsWith('$S') && !value.startsWith('I[')) {
-                 console.log(`[PARSER-FALLBACK] Found potential string content in key ${key}: ${value}`);
-                 yield { type: 'content', content: value, id: crypto.randomUUID() };
-                 break;
-             }
-         }
+         console.log("[PARSER] No linked-list content found.");
     }
     
     yield { type: 'done', id: crypto.randomUUID() };
@@ -123,7 +150,7 @@ async function handleChat(req: Request): Promise<Response> {
         const isStream = body.stream === true;
         
         const chatId = body.messages[0]?.chatId || body.chatId || crypto.randomUUID();
-        const cookie = await getCookie(chatId);
+        const cookie = await getFullSessionCookie(chatId);
 
         const rscPayload = [{
             chatId: chatId,
@@ -136,7 +163,6 @@ async function handleChat(req: Request): Promise<Response> {
         }];
 
         console.log(`[REQUEST] Payload:`, JSON.stringify(rscPayload));
-        console.log(`[REQUEST] Cookie:`, cookie);
 
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/`, {
             method: "POST",
