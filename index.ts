@@ -12,7 +12,6 @@ console.log(`🚀 Server starting on port ${PORT}`);
 // --- 2. AUTH & SESSION (Robust) ---
 function parseSetCookies(headers: Headers): string[] {
     const cookies: string[] = [];
-    // Bun's Header object has a specific getSetCookie() method
     // @ts-ignore
     if (typeof headers.getSetCookie === 'function') {
         // @ts-ignore
@@ -20,7 +19,7 @@ function parseSetCookies(headers: Headers): string[] {
         rawCookies.forEach((c: string) => {
             cookies.push(c.split(';')[0]);
         });
-    } else { // Fallback for other environments
+    } else { 
         const cookieHeader = headers.get("set-cookie");
         if (cookieHeader) {
             cookieHeader.split(',').forEach(c => {
@@ -34,14 +33,12 @@ function parseSetCookies(headers: Headers): string[] {
 async function getFullSessionCookie(chatId: string): Promise<string> {
     console.log("[SESSION] Getting full session cookie...");
     
-    // 1. Visit homepage to get initial cookies
     const homeResp = await fetch(UPSTREAM_BASE, {
         headers: { "user-agent": USER_AGENT }
     });
     const initialCookies = parseSetCookies(homeResp.headers);
     console.log("[SESSION] Initial cookies from homepage:", initialCookies);
 
-    // 2. Fetch CSRF token using initial cookies
     const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
         headers: {
             "user-agent": USER_AGENT,
@@ -51,15 +48,12 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
     const csrfCookies = parseSetCookies(csrfResp.headers);
     console.log("[SESSION] CSRF cookies:", csrfCookies);
 
-    // 3. Combine all cookies
     const allCookies = [...new Set([...initialCookies, ...csrfCookies])];
 
-    // 4. Ensure necessary cookies are present
     if (!allCookies.some(c => c.includes('__Host-authjs.csrf-token'))) {
         console.error("[SESSION-ERROR] CSRF token not found in cookies!");
     }
     
-    // 5. Add the dynamic cookies required by the working cURL
     const finalCookieList = [
         ...allCookies,
         `home_chat_id=${chatId}`,
@@ -73,7 +67,7 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
 }
 
 
-// --- 3. STREAM PARSER (SIMPLIFIED) ---
+// --- 3. STREAM PARSER (DYNAMIC START) ---
 async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -108,27 +102,38 @@ async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Arr
             }
         }
     }
-
+    
+    // --- DYNAMIC CHAIN RECONSTRUCTION ---
     let fullContent = "";
-    let currentKey = '2'; 
-    const visitedKeys = new Set();
+    
+    // Find the starting key of the linked list
+    let startKey = Object.keys(objectsMap).find(key => {
+        const obj = objectsMap[key];
+        return obj && obj.diff && obj.next;
+    });
 
-    while (objectsMap[currentKey] && !visitedKeys.has(currentKey)) {
-        visitedKeys.add(currentKey);
-        const obj = objectsMap[currentKey];
+    if (startKey) {
+        console.log(`[PARSER] Found dynamic start key for linked-list: ${startKey}`);
+        let currentKey = startKey;
+        const visitedKeys = new Set();
 
-        if (obj && obj.diff && Array.isArray(obj.diff) && obj.diff.length > 1) {
-            const contentChunk = obj.diff[1];
-            if (typeof contentChunk === 'string') {
-                console.log(`[PARSER] Found chunk in key ${currentKey}: ${contentChunk}`);
-                fullContent += contentChunk;
+        while (objectsMap[currentKey] && !visitedKeys.has(currentKey)) {
+            visitedKeys.add(currentKey);
+            const obj = objectsMap[currentKey];
+
+            if (obj && obj.diff && Array.isArray(obj.diff) && obj.diff.length > 1) {
+                const contentChunk = obj.diff[1];
+                if (typeof contentChunk === 'string') {
+                    console.log(`[PARSER] Found chunk in key ${currentKey}: ${contentChunk}`);
+                    fullContent += contentChunk;
+                }
             }
-        }
 
-        if (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
-            currentKey = obj.next.substring(2);
-        } else {
-            break;
+            if (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
+                currentKey = obj.next.substring(2);
+            } else {
+                break;
+            }
         }
     }
 
