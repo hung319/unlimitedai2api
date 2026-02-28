@@ -31,13 +31,10 @@ function parseSetCookies(headers: Headers): string[] {
 }
 
 async function getFullSessionCookie(chatId: string): Promise<string> {
-    console.log("[SESSION] Getting full session cookie...");
-    
     const homeResp = await fetch(UPSTREAM_BASE, {
         headers: { "user-agent": USER_AGENT }
     });
     const initialCookies = parseSetCookies(homeResp.headers);
-    console.log("[SESSION] Initial cookies:", initialCookies);
 
     const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
         headers: {
@@ -46,13 +43,7 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
         }
     });
     const csrfCookies = parseSetCookies(csrfResp.headers);
-    console.log("[SESSION] CSRF cookies:", csrfCookies);
-
     const allCookies = [...new Set([...initialCookies, ...csrfCookies])];
-
-    if (!allCookies.some(c => c.includes('__Host-authjs.csrf-token'))) {
-        console.error("[SESSION-ERROR] CSRF token not found!");
-    }
     
     const finalCookieList = [
         ...allCookies,
@@ -61,13 +52,11 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
     ];
 
     const finalCookieString = [...new Set(finalCookieList)].join('; ');
-    console.log("[SESSION] Final cookie string:", finalCookieString);
-
+    console.log("[SESSION] Using cookie string:", finalCookieString);
     return finalCookieString;
 }
 
-
-// --- 3. STREAM PARSER (FINAL) ---
+// --- 3. STREAM PARSER (FINAL REVISION) ---
 async function* finalRSCParser(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -77,73 +66,78 @@ async function* finalRSCParser(reader: ReadableStreamDefaultReader<Uint8Array>) 
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
         buffer += decoder.decode(value, { stream: true });
-        
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-
         for (const line of lines) {
             const match = line.match(/^([a-z0-9]+):(.+)$/);
             if (!match) continue;
-            
             const key = match[1];
             let val = match[2].trim();
-
             try {
                 objectsMap[key] = JSON.parse(val);
             } catch {
-                if (val.startsWith('"') && val.endsWith('"')) {
-                    objectsMap[key] = val.slice(1, -1);
-                } else {
-                    objectsMap[key] = val; 
-                }
+                objectsMap[key] = (val.startsWith('"') && val.endsWith('"')) ? val.slice(1, -1) : val;
             }
         }
     }
-    console.log("[PARSER] Finished reading stream. Reconstructing content.");
-    console.log("[PARSER] Objects Map:", objectsMap);
 
-    // Step 2: Find all keys that are pointed to by 'next'
-    const nextTargets = new Set<string>();
+    // Step 2: Find all diff chunks and their next pointers
+    const diffChunks: Map<string, { content: string, next: string | null }> = new Map();
+    const allNextTargets = new Set<string>();
+
     for (const key in objectsMap) {
         const obj = objectsMap[key];
-        if (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
-            nextTargets.add(obj.next.substring(2));
+        if (obj && obj.diff && Array.isArray(obj.diff) && typeof obj.diff[1] === 'string') {
+            const next = (obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) ? obj.next.substring(2) : null;
+            diffChunks.set(key, { content: obj.diff[1], next });
+            if (next) {
+                allNextTargets.add(next);
+            }
         }
     }
-    console.log("[PARSER] 'next' targets:", nextTargets);
 
-    // Step 3: Find the start key (a key that has a 'diff' but is NOT a 'next' target)
-    let startKey = Object.keys(objectsMap).find(key => {
-        const obj = objectsMap[key];
-        return obj && obj.diff && !nextTargets.has(key);
-    });
-
-    if (!startKey) {
-        // Fallback for the case where only one diff chunk exists (like the first 'Hello.')
-        startKey = Object.keys(objectsMap).find(key => objectsMap[key] && objectsMap[key].diff);
+    // Step 3: Find the head of the main chain
+    let headKey: string | undefined;
+    for (const key of diffChunks.keys()) {
+        if (!allNextTargets.has(key)) {
+            headKey = key;
+            break;
+        }
     }
-    
-    // Step 4: Reconstruct the full content by following the chain
-    let fullContent = "";
-    if (startKey) {
-        console.log(`[PARSER] Found start key for linked-list: ${startKey}`);
-        let currentKey: string | undefined = startKey;
 
-        while (currentKey && objectsMap[currentKey]) {
-            const obj = objectsMap[currentKey];
-            if (obj && obj.diff && Array.isArray(obj.diff) && obj.diff.length > 1) {
-                const contentChunk = obj.diff[1];
-                if (typeof contentChunk === 'string') {
-                    console.log(`[PARSER] Adding chunk from key ${currentKey}: ${contentChunk}`);
-                    fullContent += contentChunk;
-                }
+    // Step 4: Reconstruct content from all chains and orphans
+    let fullContent = "";
+    const processedKeys = new Set<string>();
+
+    function buildChain(startKey: string | null) {
+        let currentKey = startKey;
+        while (currentKey && diffChunks.has(currentKey) && !processedKeys.has(currentKey)) {
+            const chunk = diffChunks.get(currentKey)!;
+            fullContent += chunk.content;
+            processedKeys.add(currentKey);
+            currentKey = chunk.next;
+        }
+    }
+
+    // Build the main chain first
+    if(headKey) {
+        buildChain(headKey);
+    }
+
+    // Add content from any other chains/orphans that were not processed
+    for (const key of diffChunks.keys()) {
+        if (!processedKeys.has(key)) {
+            console.warn(`[PARSER] Found orphan chain/chunk starting at key ${key}. Prepending it.`);
+            let orphanContent = "";
+            let currentKey: string | null = key;
+             while (currentKey && diffChunks.has(currentKey) && !processedKeys.has(currentKey)) {
+                const chunk = diffChunks.get(currentKey)!;
+                orphanContent += chunk.content;
+                processedKeys.add(currentKey);
+                currentKey = chunk.next;
             }
-            // Move to the next key
-            currentKey = (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@'))
-                ? obj.next.substring(2)
-                : undefined;
+            fullContent = orphanContent + fullContent;
         }
     }
 
@@ -151,12 +145,11 @@ async function* finalRSCParser(reader: ReadableStreamDefaultReader<Uint8Array>) 
         console.log(`[PARSER] Final reconstructed content: ${fullContent}`);
         yield { type: 'content', content: fullContent, id: crypto.randomUUID() };
     } else {
-         console.log("[PARSER] No linked-list content found in the entire response.");
+         console.warn("[PARSER] No valid 'diff' content found in the entire response.");
     }
     
     yield { type: 'done', id: crypto.randomUUID() };
 }
-
 
 // --- 4. MAIN HANDLER ---
 async function handleChat(req: Request): Promise<Response> {
@@ -176,8 +169,6 @@ async function handleChat(req: Request): Promise<Response> {
             turnstileToken: "$undefined",
             deviceId: "cf8e2bd4-464b-491d-81f3-c887e662d114"
         }];
-
-        console.log(`[REQUEST] Payload:`, JSON.stringify(rscPayload));
 
         const upstreamRes = await fetch(`${UPSTREAM_BASE}/`, {
             method: "POST",
@@ -228,15 +219,13 @@ async function handleChat(req: Request): Promise<Response> {
             return new Response(stream, { headers: { "Content-Type": "text/event-stream" } });
         } else {
             let fullContent = "";
-            let finalId = "";
             for await (const chunk of parserIterator) {
                 if (chunk.type === 'content') {
                     fullContent += chunk.content;
                 }
-                finalId = chunk.id;
             }
              return Response.json({
-                id: finalId,
+                id: crypto.randomUUID(),
                 object: "chat.completion",
                 created: Math.floor(Date.now() / 1000),
                 model: "unlimited-ai",
