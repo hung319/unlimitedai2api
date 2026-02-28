@@ -9,7 +9,7 @@ const NEXT_ACTION_ID = "40713570958bf1accf30e8d3ddb17e7948e6c379fa";
 
 console.log(`🚀 Server starting on port ${PORT}`);
 
-// --- 2. AUTH & SESSION (Robust) ---
+// --- 2. AUTH & SESSION ---
 function parseSetCookies(headers: Headers): string[] {
     const cookies: string[] = [];
     // @ts-ignore
@@ -37,7 +37,7 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
         headers: { "user-agent": USER_AGENT }
     });
     const initialCookies = parseSetCookies(homeResp.headers);
-    console.log("[SESSION] Initial cookies from homepage:", initialCookies);
+    console.log("[SESSION] Initial cookies:", initialCookies);
 
     const csrfResp = await fetch(`${UPSTREAM_BASE}/api/auth/csrf`, {
         headers: {
@@ -51,7 +51,7 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
     const allCookies = [...new Set([...initialCookies, ...csrfCookies])];
 
     if (!allCookies.some(c => c.includes('__Host-authjs.csrf-token'))) {
-        console.error("[SESSION-ERROR] CSRF token not found in cookies!");
+        console.error("[SESSION-ERROR] CSRF token not found!");
     }
     
     const finalCookieList = [
@@ -61,18 +61,19 @@ async function getFullSessionCookie(chatId: string): Promise<string> {
     ];
 
     const finalCookieString = [...new Set(finalCookieList)].join('; ');
-    console.log("[SESSION] Final cookie string for request:", finalCookieString);
+    console.log("[SESSION] Final cookie string:", finalCookieString);
 
     return finalCookieString;
 }
 
 
-// --- 3. STREAM PARSER (DYNAMIC START) ---
-async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Array>) {
+// --- 3. STREAM PARSER (FINAL) ---
+async function* finalRSCParser(reader: ReadableStreamDefaultReader<Uint8Array>) {
     const decoder = new TextDecoder();
     let buffer = "";
     const objectsMap: Record<string, any> = {};
 
+    // Step 1: Read the entire stream and populate the objectsMap
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -83,8 +84,6 @@ async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Arr
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-            console.log(`[PARSER] Line: ${line.substring(0, 150)}`);
-            
             const match = line.match(/^([a-z0-9]+):(.+)$/);
             if (!match) continue;
             
@@ -102,46 +101,57 @@ async function* simplifiedRSCParser(reader: ReadableStreamDefaultReader<Uint8Arr
             }
         }
     }
-    
-    // --- DYNAMIC CHAIN RECONSTRUCTION ---
-    let fullContent = "";
-    
-    // Find the starting key of the linked list
+    console.log("[PARSER] Finished reading stream. Reconstructing content.");
+    console.log("[PARSER] Objects Map:", objectsMap);
+
+    // Step 2: Find all keys that are pointed to by 'next'
+    const nextTargets = new Set<string>();
+    for (const key in objectsMap) {
+        const obj = objectsMap[key];
+        if (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
+            nextTargets.add(obj.next.substring(2));
+        }
+    }
+    console.log("[PARSER] 'next' targets:", nextTargets);
+
+    // Step 3: Find the start key (a key that has a 'diff' but is NOT a 'next' target)
     let startKey = Object.keys(objectsMap).find(key => {
         const obj = objectsMap[key];
-        return obj && obj.diff && obj.next;
+        return obj && obj.diff && !nextTargets.has(key);
     });
 
+    if (!startKey) {
+        // Fallback for the case where only one diff chunk exists (like the first 'Hello.')
+        startKey = Object.keys(objectsMap).find(key => objectsMap[key] && objectsMap[key].diff);
+    }
+    
+    // Step 4: Reconstruct the full content by following the chain
+    let fullContent = "";
     if (startKey) {
-        console.log(`[PARSER] Found dynamic start key for linked-list: ${startKey}`);
-        let currentKey = startKey;
-        const visitedKeys = new Set();
+        console.log(`[PARSER] Found start key for linked-list: ${startKey}`);
+        let currentKey: string | undefined = startKey;
 
-        while (objectsMap[currentKey] && !visitedKeys.has(currentKey)) {
-            visitedKeys.add(currentKey);
+        while (currentKey && objectsMap[currentKey]) {
             const obj = objectsMap[currentKey];
-
             if (obj && obj.diff && Array.isArray(obj.diff) && obj.diff.length > 1) {
                 const contentChunk = obj.diff[1];
                 if (typeof contentChunk === 'string') {
-                    console.log(`[PARSER] Found chunk in key ${currentKey}: ${contentChunk}`);
+                    console.log(`[PARSER] Adding chunk from key ${currentKey}: ${contentChunk}`);
                     fullContent += contentChunk;
                 }
             }
-
-            if (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@')) {
-                currentKey = obj.next.substring(2);
-            } else {
-                break;
-            }
+            // Move to the next key
+            currentKey = (obj && obj.next && typeof obj.next === 'string' && obj.next.startsWith('$@'))
+                ? obj.next.substring(2)
+                : undefined;
         }
     }
 
     if (fullContent) {
-        console.log(`[PARSER] Reconstructed full content: ${fullContent}`);
+        console.log(`[PARSER] Final reconstructed content: ${fullContent}`);
         yield { type: 'content', content: fullContent, id: crypto.randomUUID() };
     } else {
-         console.log("[PARSER] No linked-list content found.");
+         console.log("[PARSER] No linked-list content found in the entire response.");
     }
     
     yield { type: 'done', id: crypto.randomUUID() };
@@ -192,7 +202,7 @@ async function handleChat(req: Request): Promise<Response> {
         }
         
         const reader = upstreamRes.body.getReader();
-        const parserIterator = simplifiedRSCParser(reader);
+        const parserIterator = finalRSCParser(reader);
         
         if (isStream) {
             const stream = new ReadableStream({
